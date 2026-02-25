@@ -23,6 +23,8 @@ pub enum DataKey {
     GroupReserve,
     // New: Tracks scheduled payout time for delayed release
     ScheduledPayoutTime(u64),
+    // New: Tracks individual contributions for current round (CircleID, MemberIndex)
+    CurrentRoundContribution(u64, u32),
 }
 
 #[contracttype]
@@ -33,6 +35,7 @@ pub struct Member {
     pub contribution_count: u32,
     pub last_contribution_time: u64,
     pub is_active: bool,
+    pub tier_multiplier: u32, // Multiplier for tiered contributions (e.g., 1=Bronze, 2=Silver, 3=Gold)
 }
 
 #[contracttype]
@@ -72,6 +75,7 @@ pub struct CircleInfo {
     pub nft_contract: Address,
     pub is_round_finalized: bool, // New: Track if round is finalized
     pub current_pot_recipient: Address, // New: Track who can claim the pot
+    pub member_addresses: Vec<Address>, // New: Track member addresses for efficient lookup
 }
 
 // --- CONTRACT TRAIT ---
@@ -91,7 +95,7 @@ pub trait SoroSusuTrait {
     fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64;
 
     // Join an existing circle
-    fn join_circle(env: Env, user: Address, circle_id: u64);
+    fn join_circle(env: Env, user: Address, circle_id: u64, tier_multiplier: u32);
 
     // Make a deposit (Pay your weekly/monthly due)
     fn deposit(env: Env, user: Address, circle_id: u64);
@@ -201,6 +205,19 @@ fn execute_eject_member(env: &Env, operation: &AdminOperation) {
     client.burn(&target_member, &token_id);
 }
 
+// Get member address by index from storage
+fn get_member_address_by_index(env: &Env, circle_id: u64, index: u16) -> Address {
+    let circle: CircleInfo = env.storage().instance()
+        .get(&DataKey::Circle(circle_id))
+        .unwrap_or_else(|| panic!("Circle not found"));
+    
+    if index >= circle.member_count {
+        panic!("Member index out of bounds");
+    }
+    
+    circle.member_addresses.get(index as u32).unwrap().clone()
+}
+
 // Execute finalize round operation
 fn execute_finalize_round(env: &Env, operation: &AdminOperation) {
     let circle_id = operation.circle_id;
@@ -223,8 +240,9 @@ fn execute_finalize_round(env: &Env, operation: &AdminOperation) {
     let current_time = env.ledger().timestamp();
     let scheduled_payout_time = current_time + 86400; // 24 hours in seconds
 
-    // Set the creator as the recipient for this round
-    circle.current_pot_recipient = circle.creator.clone();
+    // Set the recipient based on current rotation index
+    let recipient_address = get_member_address_by_index(&env, circle_id, circle.current_recipient_index);
+    circle.current_pot_recipient = recipient_address;
     
     // Update circle state
     circle.is_round_finalized = true;
@@ -243,6 +261,12 @@ fn execute_finalize_round(env: &Env, operation: &AdminOperation) {
     circle.is_insurance_used = false;
     
     env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    
+    // Clear current round contributions for next cycle
+    for i in 0..circle.member_count {
+        let contribution_key = DataKey::CurrentRoundContribution(circle_id, i as u32);
+        env.storage().instance().remove(&contribution_key);
+    }
 }
 
 // Execute trigger insurance operation
@@ -254,16 +278,7 @@ fn execute_trigger_insurance(env: &Env, operation: &AdminOperation) {
         .get(&DataKey::Circle(circle_id))
         .unwrap_or_else(|| panic!("Circle not found"));
 
-    // Check if insurance was already used this cycle
-    if circle.is_insurance_used {
-        panic!("Insurance already used this cycle");
-    }
-
-    // Check if there is enough balance
-    if circle.insurance_balance < circle.contribution_amount {
-        panic!("Insufficient insurance balance");
-    }
-
+    // Get member info first
     let member_key = DataKey::Member(target_member.clone());
     let member_info: Member = env.storage().instance()
         .get(&member_key)
@@ -273,14 +288,29 @@ fn execute_trigger_insurance(env: &Env, operation: &AdminOperation) {
         panic!("Member is ejected");
     }
 
+    // Check if insurance was already used this cycle
+    if circle.is_insurance_used {
+        panic!("Insurance already used this cycle");
+    }
+
+    // Check if there is enough balance
+    let member_contribution_amount = circle.contribution_amount * member_info.tier_multiplier as u64;
+    if circle.insurance_balance < member_contribution_amount {
+        panic!("Insufficient insurance balance");
+    }
+
     // Mark member as contributed in the bitmap
     if (circle.contribution_bitmap & (1 << member_info.index)) != 0 {
         panic!("Member already contributed");
     }
 
     circle.contribution_bitmap |= 1 << member_info.index;
-    circle.insurance_balance -= circle.contribution_amount;
+    circle.insurance_balance -= member_contribution_amount;
     circle.is_insurance_used = true;
+    
+    // Track the insurance contribution for current round
+    let contribution_key = DataKey::CurrentRoundContribution(circle_id, member_info.index);
+    env.storage().instance().set(&contribution_key, &member_contribution_amount);
 
     env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
 }
@@ -498,6 +528,7 @@ impl SoroSusuTrait for SoroSusu {
             nft_contract,
             is_round_finalized: false,
             current_pot_recipient: creator.clone(), // Initialize with creator
+            member_addresses: Vec::new(&env), // Initialize empty member addresses vector
         };
 
         // 4. Save the Circle and the new Count
@@ -513,7 +544,7 @@ impl SoroSusuTrait for SoroSusu {
         circle_count
     }
 
-    fn join_circle(env: Env, user: Address, circle_id: u64) {
+    fn join_circle(env: Env, user: Address, circle_id: u64, tier_multiplier: u32) {
         // 1. Authorization: The user MUST sign this transaction
         user.require_auth();
 
@@ -531,23 +562,30 @@ impl SoroSusuTrait for SoroSusu {
             panic!("User is already a member");
         }
 
-        // 5. Create and store the new member
+        // 5. Validate tier_multiplier (must be at least 1)
+        if tier_multiplier == 0 {
+            panic!("Tier multiplier must be at least 1");
+        }
+
+        // 6. Create and store the new member
         let new_member = Member {
             address: user.clone(),
             index: circle.member_count as u32,
             contribution_count: 0,
             last_contribution_time: 0,
             is_active: true,
+            tier_multiplier,
         };
         
-        // 6. Store the member and update circle count
+        // 7. Store the member and update circle count
         env.storage().instance().set(&member_key, &new_member);
+        circle.member_addresses.push_back(user.clone());
         circle.member_count += 1;
         
-        // 7. Save the updated circle back to storage
+        // 8. Save the updated circle back to storage
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
 
-        // 8. Mint Participation NFT
+        // 9. Mint Participation NFT
         // Token ID = (CircleID << 64) | MemberIndex
         let token_id = (circle_id as u128) << 64 | (new_member.index as u128);
         let client = SusuNftClient::new(&env, &circle.nft_contract);
@@ -576,10 +614,13 @@ impl SoroSusuTrait for SoroSusu {
         // 5. Check if payment is late and apply penalty if needed
         let current_time = env.ledger().timestamp();
         let mut penalty_amount = 0u64;
+        
+        // Calculate member's contribution amount based on tier
+        let member_contribution_amount = circle.contribution_amount * member.tier_multiplier as u64;
 
         if current_time > circle.deadline_timestamp {
-            // Calculate penalty based on dynamic rate
-            penalty_amount = (circle.contribution_amount * circle.late_fee_bps as u64) / 10000;
+            // Calculate penalty based on dynamic rate and member's tier
+            penalty_amount = (member_contribution_amount * circle.late_fee_bps as u64) / 10000;
             
             // Update Group Reserve balance
             let mut reserve_balance: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
@@ -588,8 +629,8 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         // 6. Calculate Insurance Fee and Transfer the full amount from user
-        let insurance_fee = ((circle.contribution_amount as u128 * circle.insurance_fee_bps as u128) / 10000) as u64;
-        let total_amount = circle.contribution_amount + insurance_fee;
+        let insurance_fee = ((member_contribution_amount as u128 * circle.insurance_fee_bps as u128) / 10000) as u64;
+        let total_amount = member_contribution_amount + insurance_fee;
 
         client.transfer(
             &user, 
@@ -608,7 +649,11 @@ impl SoroSusuTrait for SoroSusu {
         // 8. Save updated member info
         env.storage().instance().set(&member_key, &member);
 
-        // 9. Update circle deadline for next cycle
+        // 9. Track individual contribution for current round
+        let contribution_key = DataKey::CurrentRoundContribution(circle_id, member.index);
+        env.storage().instance().set(&contribution_key, &member_contribution_amount);
+
+        // 10. Update circle deadline for next cycle
         circle.deadline_timestamp = current_time + circle.cycle_duration;
         circle.contribution_bitmap |= 1 << member.index;
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
@@ -764,8 +809,21 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Payout time has not arrived yet");
         }
 
-        // Calculate pot amount
-        let pot_amount = (circle.contribution_amount * circle.member_count as u64);
+        // Calculate pot amount based on sum of current round contributions
+        let mut pot_amount = 0u64;
+        
+        // Sum up all individual contributions for the current round
+        for i in 0..circle.member_count {
+            let contribution_key = DataKey::CurrentRoundContribution(circle_id, i as u32);
+            if let Some(contribution) = env.storage().instance().get(&contribution_key) {
+                pot_amount += contribution;
+            }
+        }
+        
+        // Fallback to calculation if no individual contributions tracked (for backwards compatibility)
+        if pot_amount == 0 {
+            pot_amount = circle.contribution_amount * circle.member_count as u64;
+        }
 
         // Transfer the pot to the recipient
         let token_client = token::Client::new(&env, &circle.token);
@@ -835,7 +893,7 @@ mod fuzz_tests {
         );
 
         let user1 = Address::generate(&env);
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), max_circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), max_circle_id, 1);
 
         // Mock token balance for the test
         env.mock_all_auths();
@@ -873,7 +931,7 @@ mod fuzz_tests {
         );
 
         let user2 = Address::generate(&env);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), zero_circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), zero_circle_id, 1);
 
         env.mock_all_auths();
         
@@ -919,7 +977,7 @@ mod fuzz_tests {
             );
 
             let user = Address::generate(&env);
-            SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+            SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
 
             env.mock_all_auths();
             
@@ -978,7 +1036,7 @@ mod fuzz_tests {
             // Test joining with maximum allowed members
             for i in 0..max_members.min(10) { // Limit to 10 for test performance
                 let user = Address::generate(&env);
-                SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+                SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
                 
                 env.mock_all_auths();
                 
@@ -1019,7 +1077,7 @@ mod fuzz_tests {
         let mut users = Vec::new();
         for _ in 0..5 {
             let user = Address::generate(&env);
-            SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+            SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
             users.push(user);
         }
 
@@ -1062,7 +1120,7 @@ mod fuzz_tests {
         );
 
         // User joins the circle
-        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
 
         // Mock token balance for the test
         env.mock_all_auths();
@@ -1121,7 +1179,7 @@ mod fuzz_tests {
         );
 
         // User joins the circle
-        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
 
         // Mock token balance for the test
         env.mock_all_auths();
@@ -1168,8 +1226,8 @@ mod fuzz_tests {
             nft_contract.clone(),
         );
 
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
 
         env.mock_all_auths();
 
@@ -1223,8 +1281,8 @@ mod fuzz_tests {
             nft_contract.clone(),
         );
 
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
         SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id);
 
         env.mock_all_auths();
@@ -1270,8 +1328,8 @@ mod fuzz_tests {
         );
 
         // Add members
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
         SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id);
 
         env.mock_all_auths();
@@ -1289,7 +1347,7 @@ mod fuzz_tests {
         // Check that round is finalized and scheduled payout time is set
         let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
         assert!(circle.is_round_finalized);
-        assert_eq!(circle.current_pot_recipient, creator);
+        assert_eq!(circle.current_pot_recipient, user1); // First member should be recipient
 
         let scheduled_time: u64 = env.storage().instance().get(&DataKey::ScheduledPayoutTime(circle_id)).unwrap();
         let current_time = env.ledger().timestamp();
@@ -1298,7 +1356,7 @@ mod fuzz_tests {
 
         // Try to claim before time buffer - should fail
         let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::claim_pot(env.clone(), creator.clone(), circle_id);
+            SoroSusuTrait::claim_pot(env.clone(), user1.clone(), circle_id);
         });
         assert!(result.is_err());
 
@@ -1307,7 +1365,7 @@ mod fuzz_tests {
 
         // Now claim should succeed
         let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::claim_pot(env.clone(), creator.clone(), circle_id);
+            SoroSusuTrait::claim_pot(env.clone(), user1.clone(), circle_id);
         });
         assert!(result.is_ok());
 
@@ -1340,8 +1398,8 @@ mod fuzz_tests {
             nft_contract.clone(),
         );
 
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
 
         env.mock_all_auths();
 
@@ -1396,8 +1454,8 @@ mod fuzz_tests {
             nft_contract.clone(),
         );
 
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
 
         env.mock_all_auths();
 
@@ -1414,13 +1472,13 @@ mod fuzz_tests {
 
         // Non-recipient trying to claim should fail
         let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::claim_pot(env.clone(), user1.clone(), circle_id);
+            SoroSusuTrait::claim_pot(env.clone(), user2.clone(), circle_id);
         });
         assert!(result.is_err());
 
-        // Creator (recipient) should be able to claim
+        // First member (recipient) should be able to claim
         let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::claim_pot(env.clone(), creator.clone(), circle_id);
+            SoroSusuTrait::claim_pot(env.clone(), user1.clone(), circle_id);
         });
         assert!(result.is_ok());
     }
@@ -1448,7 +1506,7 @@ mod fuzz_tests {
         );
 
         // Join should trigger mint (mocked)
-        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
 
         env.mock_all_auths();
 
@@ -1531,7 +1589,7 @@ mod fuzz_tests {
             nft_contract.clone(),
         );
         
-        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
         
         // Test multi-sig eject member operation
         env.mock_all_auths();
@@ -1581,7 +1639,7 @@ mod fuzz_tests {
             nft_contract.clone(),
         );
         
-        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
         
         // Legacy admin should still be able to propose operations
         env.mock_all_auths();
@@ -1668,8 +1726,8 @@ mod fuzz_tests {
             nft_contract.clone(),
         );
         
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
         
         // Mock deposits
         env.mock_all_auths();
