@@ -24,11 +24,28 @@ pub enum Error {
     InsufficientInsurance = 12,
     InsuranceAlreadyUsed = 13,
     RateLimitExceeded = 14,
+    InsufficientCollateral = 15,
+    CollateralAlreadyStaked = 16,
+    CollateralNotStaked = 17,
+    CollateralLocked = 18,
+    MemberNotDefaulted = 19,
+    CollateralAlreadyReleased = 20,
+    LeniencyRequestNotFound = 21,
+    AlreadyVoted = 22,
+    VotingPeriodExpired = 23,
+    LeniencyAlreadyApproved = 24,
+    LeniencyNotRequested = 25,
+    CannotVoteForOwnRequest = 26,
+    InvalidVote = 27,
 }
 
 // --- CONSTANTS ---
 const REFERRAL_DISCOUNT_BPS: u32 = 500; // 5%
 const RATE_LIMIT_SECONDS: u64 = 300; // 5 minutes
+const LENIENCY_GRACE_PERIOD: u64 = 172800; // 48 hours in seconds
+const VOTING_PERIOD: u64 = 86400; // 24 hours voting period
+const MINIMUM_VOTING_PARTICIPATION: u32 = 50; // 50% minimum participation
+const SIMPLE_MAJORITY_THRESHOLD: u32 = 51; // 51% simple majority
 
 // --- DATA STRUCTURES ---
 
@@ -45,6 +62,13 @@ pub enum DataKey {
     LastCreatedTimestamp(Address),
     SafetyDeposit(Address, u64),
     LendingPool,
+    CollateralVault(Address, u64),
+    CollateralConfig(u64),
+    DefaultedMembers(u64),
+    LeniencyRequest(u64, Address),
+    LeniencyVotes(u64, Address, Address),
+    SocialCapital(Address, u64),
+    LeniencyStats(u64),
 }
 
 #[contracttype]
@@ -53,6 +77,59 @@ pub enum MemberStatus {
     Active,
     AwaitingReplacement,
     Ejected,
+    Defaulted,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LeniencyVote {
+    Approve,
+    Reject,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LeniencyRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LeniencyRequest {
+    pub requester: Address,
+    pub circle_id: u64,
+    pub request_timestamp: u64,
+    pub voting_deadline: u64,
+    pub status: LeniencyRequestStatus,
+    pub approve_votes: u32,
+    pub reject_votes: u32,
+    pub total_votes_cast: u32,
+    pub extension_hours: u64,
+    pub reason: String,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LeniencyStats {
+    pub total_requests: u32,
+    pub approved_requests: u32,
+    pub rejected_requests: u32,
+    pub expired_requests: u32,
+    pub average_participation: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SocialCapital {
+    pub member: Address,
+    pub circle_id: u64,
+    pub leniency_given: u32,
+    pub leniency_received: u32,
+    pub voting_participation: u32,
+    pub trust_score: u32,
 }
 
 #[contracttype]
@@ -89,6 +166,8 @@ pub struct CircleInfo {
     pub nft_contract: Address,
     pub is_round_finalized: bool,
     pub current_pot_recipient: Option<Address>,
+    pub leniency_enabled: bool,
+    pub grace_period_end: Option<u64>,
 }
 
 // --- CONTRACT CLIENTS ---
@@ -133,6 +212,14 @@ pub trait SoroSusuTrait {
     
     fn pair_with_member(env: Env, user: Address, buddy_address: Address);
     fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: i128);
+    
+    // Leniency voting functions
+    fn request_leniency(env: Env, requester: Address, circle_id: u64, reason: String);
+    fn vote_on_leniency(env: Env, voter: Address, circle_id: u64, requester: Address, vote: LeniencyVote);
+    fn finalize_leniency_vote(env: Env, caller: Address, circle_id: u64, requester: Address);
+    fn get_leniency_request(env: Env, circle_id: u64, requester: Address) -> LeniencyRequest;
+    fn get_social_capital(env: Env, member: Address, circle_id: u64) -> SocialCapital;
+    fn get_leniency_stats(env: Env, circle_id: u64) -> LeniencyStats;
 }
 
 // --- IMPLEMENTATION ---
@@ -202,6 +289,8 @@ impl SoroSusuTrait for SoroSusu {
             nft_contract,
             is_round_finalized: false,
             current_pot_recipient: None,
+            leniency_enabled: true,
+            grace_period_end: None,
         };
 
         env.storage().instance().set(&DataKey::Circle(circle_count), &new_circle);
@@ -259,7 +348,10 @@ impl SoroSusuTrait for SoroSusu {
         let base_amount = circle.contribution_amount * member.tier_multiplier as i128;
         let mut penalty_amount = 0i128;
 
-        if current_time > circle.deadline_timestamp {
+        // Check if late fee applies (considering grace periods)
+        let effective_deadline = circle.grace_period_end.unwrap_or(circle.deadline_timestamp);
+        
+        if current_time > effective_deadline {
             let base_penalty = (base_amount * circle.late_fee_bps as i128) / 10000;
             // Apply referral discount
             let mut discount = 0i128;
@@ -445,5 +537,255 @@ impl SoroSusuTrait for SoroSusu {
         let mut balance: i128 = env.storage().instance().get(&safety_key).unwrap_or(0);
         balance += amount;
         env.storage().instance().set(&safety_key, &balance);
+    }
+
+    // --- LENIENCY VOTING IMPLEMENTATION ---
+
+    fn request_leniency(env: Env, requester: Address, circle_id: u64, reason: String) {
+        requester.require_auth();
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        let member_key = DataKey::Member(requester.clone());
+        let member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+
+        if member_info.status != MemberStatus::Active {
+            panic!("Member not active");
+        }
+
+        // Check if there's already a pending request
+        let request_key = DataKey::LeniencyRequest(circle_id, requester.clone());
+        if let Some(existing_request) = env.storage().instance().get::<DataKey, LeniencyRequest>(&request_key) {
+            if existing_request.status == LeniencyRequestStatus::Pending {
+                panic!("Leniency request already pending");
+            }
+        }
+
+        let current_time = env.ledger().timestamp();
+        let voting_deadline = current_time + VOTING_PERIOD;
+
+        let new_request = LeniencyRequest {
+            requester: requester.clone(),
+            circle_id,
+            request_timestamp: current_time,
+            voting_deadline,
+            status: LeniencyRequestStatus::Pending,
+            approve_votes: 0,
+            reject_votes: 0,
+            total_votes_cast: 0,
+            extension_hours: 48, // 48 hours grace period
+            reason,
+        };
+
+        env.storage().instance().set(&request_key, &new_request);
+
+        // Update leniency stats
+        let stats_key = DataKey::LeniencyStats(circle_id);
+        let mut stats: LeniencyStats = env.storage().instance().get(&stats_key).unwrap_or(LeniencyStats {
+            total_requests: 0,
+            approved_requests: 0,
+            rejected_requests: 0,
+            expired_requests: 0,
+            average_participation: 0,
+        });
+        stats.total_requests += 1;
+        env.storage().instance().set(&stats_key, &stats);
+    }
+
+    fn vote_on_leniency(env: Env, voter: Address, circle_id: u64, requester: Address, vote: LeniencyVote) {
+        voter.require_auth();
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        let voter_key = DataKey::Member(voter.clone());
+        let voter_info: Member = env.storage().instance().get(&voter_key).expect("Voter not found");
+
+        if voter_info.status != MemberStatus::Active {
+            panic!("Voter not active");
+        }
+
+        if voter == requester {
+            panic!("Cannot vote for own request");
+        }
+
+        let request_key = DataKey::LeniencyRequest(circle_id, requester.clone());
+        let mut request: LeniencyRequest = env.storage().instance().get(&request_key)
+            .expect("Leniency request not found");
+
+        if request.status != LeniencyRequestStatus::Pending {
+            panic!("Voting period has ended");
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time > request.voting_deadline {
+            request.status = LeniencyRequestStatus::Expired;
+            env.storage().instance().set(&request_key, &request);
+            panic!("Voting period expired");
+        }
+
+        // Check if already voted
+        let vote_key = DataKey::LeniencyVotes(circle_id, voter.clone(), requester.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("Already voted");
+        }
+
+        // Record the vote
+        env.storage().instance().set(&vote_key, &vote);
+        request.total_votes_cast += 1;
+
+        match vote {
+            LeniencyVote::Approve => request.approve_votes += 1,
+            LeniencyVote::Reject => request.reject_votes += 1,
+        }
+
+        // Update social capital
+        let social_capital_key = DataKey::SocialCapital(voter.clone(), circle_id);
+        let mut social_capital: SocialCapital = env.storage().instance().get(&social_capital_key).unwrap_or(SocialCapital {
+            member: voter.clone(),
+            circle_id,
+            leniency_given: 0,
+            leniency_received: 0,
+            voting_participation: 0,
+            trust_score: 50, // Start with neutral score
+        });
+        social_capital.voting_participation += 1;
+        
+        // Update trust score based on voting patterns
+        if vote == LeniencyVote::Approve {
+            social_capital.leniency_given += 1;
+            social_capital.trust_score = (social_capital.trust_score + 2).min(100); // Increase trust score
+        } else {
+            social_capital.trust_score = (social_capital.trust_score - 1).max(0); // Decrease trust score
+        }
+        
+        env.storage().instance().set(&social_capital_key, &social_capital);
+
+        // Check if voting should be finalized early (if majority reached)
+        let total_possible_votes = (circle.member_count - 1) as u32; // Exclude requester
+        let votes_needed_for_majority = (total_possible_votes * SIMPLE_MAJORITY_THRESHOLD) / 100;
+        
+        if request.approve_votes >= votes_needed_for_majority {
+            request.status = LeniencyRequestStatus::Approved;
+            self.finalize_leniency_vote_internal(&env, &circle_id, &requester, &mut request);
+        } else if request.reject_votes >= votes_needed_for_majority {
+            request.status = LeniencyRequestStatus::Rejected;
+        }
+
+        env.storage().instance().set(&request_key, &request);
+    }
+
+    fn finalize_leniency_vote(env: Env, caller: Address, circle_id: u64, requester: Address) {
+        caller.require_auth();
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        
+        let request_key = DataKey::LeniencyRequest(circle_id, requester.clone());
+        let mut request: LeniencyRequest = env.storage().instance().get(&request_key)
+            .expect("Leniency request not found");
+
+        if request.status != LeniencyRequestStatus::Pending {
+            panic!("Request already finalized");
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time <= request.voting_deadline {
+            panic!("Voting period not yet expired");
+        }
+
+        self.finalize_leniency_vote_internal(&env, &circle_id, &requester, &mut request);
+        env.storage().instance().set(&request_key, &request);
+    }
+
+    fn finalize_leniency_vote_internal(&env: &Env, circle_id: &u64, requester: &Address, request: &mut LeniencyRequest) {
+        // Calculate voting results
+        let total_possible_votes = request.total_votes_cast;
+        let minimum_participation = (total_possible_votes * MINIMUM_VOTING_PARTICIPATION) / 100;
+        
+        let mut final_status = LeniencyRequestStatus::Rejected;
+        
+        if request.total_votes_cast >= minimum_participation {
+            let approval_percentage = (request.approve_votes * 100) / request.total_votes_cast;
+            if approval_percentage >= SIMPLE_MAJORITY_THRESHOLD {
+                final_status = LeniencyRequestStatus::Approved;
+                
+                // Apply grace period extension
+                let circle_key = DataKey::Circle(*circle_id);
+                let mut circle: CircleInfo = env.storage().instance().get(&circle_key).expect("Circle not found");
+                
+                let extension_seconds = request.extension_hours * 3600;
+                let new_deadline = circle.deadline_timestamp + extension_seconds;
+                circle.deadline_timestamp = new_deadline;
+                circle.grace_period_end = Some(new_deadline);
+                
+                env.storage().instance().set(&circle_key, &circle);
+                
+                // Update requester's social capital
+                let social_capital_key = DataKey::SocialCapital(requester.clone(), *circle_id);
+                let mut social_capital: SocialCapital = env.storage().instance().get(&social_capital_key).unwrap_or(SocialCapital {
+                    member: requester.clone(),
+                    circle_id: *circle_id,
+                    leniency_given: 0,
+                    leniency_received: 0,
+                    voting_participation: 0,
+                    trust_score: 50,
+                });
+                social_capital.leniency_received += 1;
+                social_capital.trust_score = (social_capital.trust_score + 5).min(100); // Bonus for receiving leniency
+                env.storage().instance().set(&social_capital_key, &social_capital);
+            }
+        }
+        
+        request.status = final_status;
+
+        // Update leniency stats
+        let stats_key = DataKey::LeniencyStats(*circle_id);
+        let mut stats: LeniencyStats = env.storage().instance().get(&stats_key).unwrap_or(LeniencyStats {
+            total_requests: 0,
+            approved_requests: 0,
+            rejected_requests: 0,
+            expired_requests: 0,
+            average_participation: 0,
+        });
+
+        match final_status {
+            LeniencyRequestStatus::Approved => stats.approved_requests += 1,
+            LeniencyRequestStatus::Rejected => stats.rejected_requests += 1,
+            LeniencyRequestStatus::Expired => stats.expired_requests += 1,
+            _ => {}
+        }
+
+        // Update average participation
+        if stats.total_requests > 0 {
+            let total_participation = stats.average_participation * (stats.total_requests - 1) + request.total_votes_cast;
+            stats.average_participation = total_participation / stats.total_requests;
+        }
+
+        env.storage().instance().set(&stats_key, &stats);
+    }
+
+    fn get_leniency_request(env: Env, circle_id: u64, requester: Address) -> LeniencyRequest {
+        let request_key = DataKey::LeniencyRequest(circle_id, requester);
+        env.storage().instance().get(&request_key).expect("Leniency request not found")
+    }
+
+    fn get_social_capital(env: Env, member: Address, circle_id: u64) -> SocialCapital {
+        let social_capital_key = DataKey::SocialCapital(member, circle_id);
+        env.storage().instance().get(&social_capital_key).unwrap_or(SocialCapital {
+            member,
+            circle_id,
+            leniency_given: 0,
+            leniency_received: 0,
+            voting_participation: 0,
+            trust_score: 50,
+        })
+    }
+
+    fn get_leniency_stats(env: Env, circle_id: u64) -> LeniencyStats {
+        let stats_key = DataKey::LeniencyStats(circle_id);
+        env.storage().instance().get(&stats_key).unwrap_or(LeniencyStats {
+            total_requests: 0,
+            approved_requests: 0,
+            rejected_requests: 0,
+            expired_requests: 0,
+            average_participation: 0,
+        })
     }
 }
