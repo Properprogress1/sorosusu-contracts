@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
 };
 
 // --- ERROR CODES ---
@@ -161,6 +161,8 @@ pub trait SoroSusuTrait {
 
     fn propose_arbitrator(env: Env, user: Address, circle_id: u64, new_arbitrator: Address);
     fn vote_arbitrator(env: Env, user: Address, circle_id: u64);
+
+    fn transfer_membership(env: Env, old_user: Address, new_user: Address, circle_id: u64);
 }
 
 // --- IMPLEMENTATION ---
@@ -435,8 +437,8 @@ impl SoroSusuTrait for SoroSusu {
         let new_index = (circle.current_recipient_index + 1) % circle.member_count;
         if new_index == 0 {
             let total_volume = pot_amount * (circle.member_count as i128);
-            env.events().publish((symbol_short!("CYCLE_COMP"), circle_id), total_volume);
-            env.events().publish((symbol_short!("GROUP_ROLL"), circle_id), 0u32);
+            env.events().publish((Symbol::new(&env, "CYCLE_COMP"), circle_id), total_volume);
+            env.events().publish((Symbol::new(&env, "GROUP_ROLL"), circle_id), 0u32);
         }
         circle.current_recipient_index = new_index;
         circle.current_pot_recipient = None; // Should be set in finalize_round
@@ -628,12 +630,60 @@ impl SoroSusuTrait for SoroSusu {
 
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
+
+    fn transfer_membership(env: Env, old_user: Address, new_user: Address, circle_id: u64) {
+        old_user.require_auth();
+        new_user.require_auth();
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        let old_member_key = DataKey::Member(old_user.clone());
+        let mut old_member: Member = env.storage().instance().get(&old_member_key).expect("Member not found");
+
+        if old_member.status != MemberStatus::Active {
+            panic!("Member not active");
+        }
+
+        let new_member_key = DataKey::Member(new_user.clone());
+        if env.storage().instance().has(&new_member_key) {
+            panic!("Already member");
+        }
+
+        let base_amount = circle.contribution_amount * old_member.tier_multiplier as i128;
+        let buyout_amount = base_amount * old_member.contribution_count as i128;
+
+        if buyout_amount > 0 {
+            let token_client = token::Client::new(&env, &circle.token);
+            token_client.transfer(&new_user, &old_user, &buyout_amount);
+        }
+
+        env.storage().instance().set(&DataKey::CircleMember(circle_id, old_member.index), &new_user);
+
+        let new_member = Member {
+            address: new_user.clone(),
+            index: old_member.index,
+            contribution_count: old_member.contribution_count,
+            last_contribution_time: old_member.last_contribution_time,
+            status: MemberStatus::Active,
+            tier_multiplier: old_member.tier_multiplier,
+            referrer: old_member.referrer.clone(),
+            buddy: None,
+        };
+        env.storage().instance().set(&new_member_key, &new_member);
+
+        old_member.status = MemberStatus::Ejected;
+        env.storage().instance().set(&old_member_key, &old_member);
+
+        let nft_client = SusuNftClient::new(&env, &circle.nft_contract);
+        let token_id = (circle_id as u128) << 64 | (old_member.index as u128);
+        nft_client.burn(&old_user, &token_id);
+        nft_client.mint(&new_user, &token_id);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+    use soroban_sdk::{testutils::Address as _, Env};
 
     #[contract]
     pub struct MockNft;
@@ -761,5 +811,44 @@ mod tests {
         client.init(&admin);
         
         client.set_protocol_fee(&admin, &50, &treasury); // 0.5% fee
+    }
+
+    #[test]
+    fn test_transfer_membership() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let old_user = Address::generate(&env);
+        let new_user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1000,
+            &10,
+            &token_contract,
+            &86400,
+            &100, // 1%
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&old_user, &circle_id, &1, &None);
+        client.deposit(&old_user, &circle_id);
+        
+        client.transfer_membership(&old_user, &new_user, &circle_id);
+        
+        // The new user should now be able to act on behalf of the old position 
+        client.deposit(&new_user, &circle_id);
     }
 }

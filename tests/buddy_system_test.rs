@@ -1,5 +1,5 @@
 use soroban_sdk::{Env, Address, testutils::Address as _, contract, contractimpl, token};
-use sorosusu_contracts::{SoroSusu, SoroSusuClient, SoroSusuTrait};
+use sorosusu_contracts::{SoroSusu, SoroSusuClient};
 
 #[contract]
 pub struct MockNft;
@@ -22,7 +22,7 @@ fn test_buddy_pairing() {
     
     // Register mock token
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract(token_admin.clone());
+    let token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     
     let nft_contract = env.register_contract(None, MockNft);
 
@@ -33,6 +33,7 @@ fn test_buddy_pairing() {
     client.init(&admin);
 
     // Create a circle
+    let arbitrator = Address::generate(&env);
     let circle_id = client.create_circle(
         &creator,
         &1000,
@@ -41,6 +42,7 @@ fn test_buddy_pairing() {
         &604800,
         &0,
         &nft_contract,
+        &arbitrator,
     );
 
     // Both users join the circle
@@ -72,7 +74,7 @@ fn test_buddy_payment_fallback() {
     
     // Register mock token
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract(token_admin.clone());
+    let token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     
     let nft_contract = env.register_contract(None, MockNft);
 
@@ -83,6 +85,7 @@ fn test_buddy_payment_fallback() {
     client.init(&admin);
 
     // Create a circle
+    let arbitrator = Address::generate(&env);
     let circle_id = client.create_circle(
         &creator,
         &1000,
@@ -91,6 +94,7 @@ fn test_buddy_payment_fallback() {
         &604800,
         &0,
         &nft_contract,
+        &arbitrator,
     );
 
     // Both users join the circle

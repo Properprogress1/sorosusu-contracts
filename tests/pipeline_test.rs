@@ -1,6 +1,6 @@
 #![cfg(test)]
 use soroban_sdk::{testutils::Address as _, Address, Env, token, contract, contractimpl};
-use sorosusu_contracts::{SoroSusu, SoroSusuClient, SoroSusuTrait};
+use sorosusu_contracts::{SoroSusu, SoroSusuClient};
 
 #[contract]
 pub struct MockNft;
@@ -30,7 +30,7 @@ fn test_full_rosca_cycle() {
     
     // Deploy mock token
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract(token_admin.clone());
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     let token_client = token::StellarAssetClient::new(&env, &token_id);
     let token_token_client = token::Client::new(&env, &token_id);
     
@@ -44,6 +44,7 @@ fn test_full_rosca_cycle() {
     // Create circle
     let contribution_amount: i128 = 1000;
     let cycle_duration: u64 = 86400; // 1 day
+    let arbitrator = Address::generate(&env);
     let circle_id = client.create_circle(
         &creator,
         &contribution_amount,
@@ -52,6 +53,7 @@ fn test_full_rosca_cycle() {
         &cycle_duration,
         &100, // 1% insurance fee
         &nft_id,
+        &arbitrator,
     );
     
     // Join circle

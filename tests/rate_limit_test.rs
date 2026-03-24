@@ -35,12 +35,13 @@ fn test_rate_limit_exact_boundary() {
 #[test]
 fn test_rate_limit_multiple_users() {
     // Different users should have independent rate limits
+    #[allow(dead_code)]
     struct UserCreation {
         user_id: u32,
         timestamp: u64,
     }
     
-    let creations = vec![
+    let _creations = vec![
         UserCreation { user_id: 1, timestamp: 1000 },
         UserCreation { user_id: 2, timestamp: 1100 }, // Different user, should be allowed
         UserCreation { user_id: 1, timestamp: 1200 }, // Same user within 5 min, should fail
