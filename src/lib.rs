@@ -1,7 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
-    Address, Env, String, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Env,
 };
 
 // --- ERROR CODES ---
@@ -24,6 +23,7 @@ pub enum Error {
     InsufficientInsurance = 12,
     InsuranceAlreadyUsed = 13,
     RateLimitExceeded = 14,
+    Blacklisted = 15,
     InsufficientCollateral = 15,
     CollateralAlreadyStaked = 16,
     CollateralNotStaked = 17,
@@ -70,6 +70,7 @@ pub enum DataKey {
     Admin,
     Circle(u64),
     Member(Address),
+    GlobalBlacklist(Address),
     CircleCount,
     Deposit(u64, Address),
     GroupReserve,
@@ -308,6 +309,9 @@ pub trait LendingPoolTrait {
 pub trait SoroSusuTrait {
     fn init(env: Env, admin: Address);
     fn set_lending_pool(env: Env, admin: Address, pool: Address);
+    fn flag_member_for_default(env: Env, caller: Address, circle_id: u64, member: Address);
+    fn clear_global_blacklist(env: Env, admin: Address, member: Address);
+    fn is_globally_blacklisted(env: Env, member: Address) -> bool;
     
     fn create_circle(
         env: Env,
@@ -387,6 +391,41 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::LendingPool, &pool);
     }
 
+    fn flag_member_for_default(env: Env, caller: Address, circle_id: u64, member: Address) {
+        caller.require_auth();
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if caller != circle.creator && caller != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let member_key = DataKey::Member(member.clone());
+        if !env.storage().instance().has(&member_key) {
+            panic!("Member not found");
+        }
+
+        env.storage().instance().set(&DataKey::GlobalBlacklist(member), &true);
+    }
+
+    fn clear_global_blacklist(env: Env, admin: Address, member: Address) {
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        env.storage().instance().remove(&DataKey::GlobalBlacklist(member));
+    }
+
+    fn is_globally_blacklisted(env: Env, member: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::GlobalBlacklist(member))
+            .unwrap_or(false)
+    }
+
     fn create_circle(
         env: Env,
         creator: Address,
@@ -453,6 +492,15 @@ impl SoroSusuTrait for SoroSusu {
 
     fn join_circle(env: Env, user: Address, circle_id: u64, tier_multiplier: u32, referrer: Option<Address>) {
         user.require_auth();
+
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::GlobalBlacklist(user.clone()))
+            .unwrap_or(false)
+        {
+            panic!("User is globally blacklisted");
+        }
 
         let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
         if circle.member_count >= circle.max_members {
@@ -679,6 +727,7 @@ impl SoroSusuTrait for SoroSusu {
         circle.insurance_balance -= amount_needed;
         circle.is_insurance_used = true;
 
+        env.storage().instance().set(&DataKey::GlobalBlacklist(member), &true);
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
