@@ -50,6 +50,16 @@ const ROLLOVER_QUORUM: u32 = 60; // 60% quorum for rollover voting
 const ROLLOVER_MAJORITY: u32 = 66; // 66% supermajority for rollover approval
 const DEFAULT_ROLLOVER_BONUS_BPS: u32 = 5000; // 50% of platform fee refunded as bonus
 
+// Yield Delegation Constants
+const YIELD_VOTING_PERIOD: u64 = 86400; // 24 hours for yield delegation voting
+const YIELD_QUORUM: u32 = 75; // 75% quorum for yield delegation (higher stakes)
+const YIELD_MAJORITY: u32 = 80; // 80% supermajority for yield delegation approval
+const MIN_DELEGATION_AMOUNT: i128 = 100_000_000; // Minimum 10 tokens to delegate
+const MAX_DELEGATION_PERCENTAGE: u32 = 8000; // Maximum 80% of pot can be delegated
+const YIELD_DISTRIBUTION_RECIPIENT_BPS: u32 = 5000; // 50% to current round winner
+const YIELD_DISTRIBUTION_TREASURY_BPS: u32 = 5000; // 50% to group treasury
+const YIELD_COMPOUNDING_FREQUENCY: u64 = 604800; // Weekly compounding (7 days)
+
 // --- DATA STRUCTURES ---
 
 #[contracttype]
@@ -85,6 +95,10 @@ pub enum DataKey {
     VotingPower(Address, u64),
     DissolutionProposal(u64),
     RefundClaim(u64),
+    YieldDelegation(u64),
+    YieldVote(u64, Address),
+    YieldPoolRegistry,
+    GroupTreasury(u64),
 }
 
 #[contracttype]
@@ -269,6 +283,85 @@ pub enum RolloverStatus {
     Approved,
     Rejected,
     Applied,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldVoteChoice {
+    For,
+    Against,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldDelegationStatus {
+    NotInitiated,
+    Voting,
+    Approved,
+    Rejected,
+    Active,
+    Completed,
+    Withdrawn,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldPoolType {
+    StellarLiquidityPool,
+    RegulatedMoneyMarket,
+    StableYieldVault,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldDelegation {
+    pub circle_id: u64,
+    pub delegation_amount: i128,
+    pub pool_address: Address,
+    pub pool_type: YieldPoolType,
+    pub delegation_percentage: u32, // Percentage of pot to delegate
+    pub created_timestamp: u64,
+    pub status: YieldDelegationStatus,
+    pub voting_deadline: u64,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+    pub start_time: Option<u64>,
+    pub end_time: Option<u64>,
+    pub total_yield_earned: i128,
+    pub yield_distributed: i128,
+    pub last_compound_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldVote {
+    pub voter: Address,
+    pub circle_id: u64,
+    pub vote_choice: YieldVoteChoice,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldPoolInfo {
+    pub pool_address: Address,
+    pub pool_type: YieldPoolType,
+    pub is_active: bool,
+    pub total_delegated: i128,
+    pub apy_bps: u32, // Annual Percentage Yield in basis points
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldDistribution {
+    pub circle_id: u64,
+    pub recipient_share: i128,
+    pub treasury_share: i128,
+    pub total_yield: i128,
+    pub distribution_time: u64,
+    pub round_number: u32,
 }
 
 #[contracttype]
@@ -535,6 +628,15 @@ pub trait SoroSusuTrait {
     fn propose_rollover_bonus(env: Env, user: Address, circle_id: u64, fee_percentage_bps: u32);
     fn vote_rollover_bonus(env: Env, user: Address, circle_id: u64, vote_choice: RolloverVoteChoice);
     fn apply_rollover_bonus(env: Env, circle_id: u64);
+
+    // Idle Pot Yield Delegation to Stellar Pools
+    fn propose_yield_delegation(env: Env, user: Address, circle_id: u64, delegation_percentage: u32, pool_address: Address, pool_type: YieldPoolType);
+    fn vote_yield_delegation(env: Env, user: Address, circle_id: u64, vote_choice: YieldVoteChoice);
+    fn approve_yield_delegation(env: Env, circle_id: u64);
+    fn execute_yield_delegation(env: Env, circle_id: u64);
+    fn compound_yield(env: Env, circle_id: u64);
+    fn withdraw_yield_delegation(env: Env, circle_id: u64);
+    fn distribute_yield_earnings(env: Env, circle_id: u64);
 
     // Inter-contract reputation query interface
     fn get_reputation(env: Env, user: Address) -> ReputationData;
@@ -1106,6 +1208,33 @@ impl SoroSusuTrait for SoroSusu {
         if circle.contribution_bitmap != expected_bitmap {
             panic!("Not all contributed");
         }
+
+        // Set round as finalized and determine next recipient
+        circle.is_round_finalized = true;
+        
+        // Set next recipient (round-robin)
+        let next_recipient_index = (circle.current_recipient_index + 1) % circle.member_count;
+        let next_recipient = get_member_address_by_index(&circle, next_recipient_index);
+        
+        circle.current_recipient_index = next_recipient_index;
+        circle.current_pot_recipient = Some(next_recipient);
+        
+        // Schedule payout time (end of month from now)
+        let current_time = env.ledger().timestamp();
+        let payout_time = current_time + (30 * 24 * 60 * 60); // 30 days from now
+        env.storage().instance().set(&DataKey::ScheduledPayoutTime(circle_id), &payout_time);
+        
+        // Reset for next round
+        circle.contribution_bitmap = 0;
+        circle.deadline_timestamp = current_time + circle.cycle_duration;
+        
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        
+        // Publish round finalization event
+        env.events().publish(
+            (Symbol::new(&env, "ROUND_FINALIZED"), circle_id),
+            (next_recipient, payout_time, next_recipient_index),
+        );
 
 
     }
@@ -1735,6 +1864,369 @@ impl SoroSusuTrait for SoroSusu {
         );
     }
 
+    fn propose_yield_delegation(env: Env, user: Address, circle_id: u64, delegation_percentage: u32, pool_address: Address, pool_type: YieldPoolType) {
+        user.require_auth();
+
+        if delegation_percentage > MAX_DELEGATION_PERCENTAGE {
+            panic!("Delegation percentage exceeds maximum");
+        }
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .expect("User is not a member");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Check if there's already an active yield delegation proposal
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        if let Some(existing_delegation) = env.storage().instance().get::<DataKey, YieldDelegation>(&delegation_key) {
+            if existing_delegation.status == YieldDelegationStatus::Voting || 
+               existing_delegation.status == YieldDelegationStatus::Active {
+                panic!("Yield delegation already active");
+            }
+        }
+
+        // Only allow yield delegation after round is finalized but before payout
+        if !circle.is_round_finalized {
+            panic!("Round must be finalized before yield delegation");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let pot_amount = circle.contribution_amount * (circle.member_count as i128);
+        let delegation_amount = (pot_amount * delegation_percentage as i128) / 10000;
+
+        if delegation_amount < MIN_DELEGATION_AMOUNT {
+            panic!("Delegation amount below minimum");
+        }
+
+        let yield_delegation = YieldDelegation {
+            circle_id,
+            delegation_amount,
+            pool_address: pool_address.clone(),
+            pool_type: pool_type.clone(),
+            delegation_percentage,
+            created_timestamp: current_time,
+            status: YieldDelegationStatus::Voting,
+            voting_deadline: current_time + YIELD_VOTING_PERIOD,
+            for_votes: 0,
+            against_votes: 0,
+            total_votes_cast: 0,
+            start_time: None,
+            end_time: None,
+            total_yield_earned: 0,
+            yield_distributed: 0,
+            last_compound_time: current_time,
+        };
+
+        env.storage().instance().set(&delegation_key, &yield_delegation);
+        
+        // The proposer automatically votes for
+        let vote_key = DataKey::YieldVote(circle_id, user.clone());
+        let vote = YieldVote {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: YieldVoteChoice::For,
+            timestamp: current_time,
+        };
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update vote counts
+        let mut updated_delegation = yield_delegation;
+        updated_delegation.for_votes = 1;
+        updated_delegation.total_votes_cast = 1;
+        env.storage().instance().set(&delegation_key, &updated_delegation);
+
+        write_audit(&env, &user, AuditAction::DisputeSubmission, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_PROPOSED"), circle_id, user.clone()),
+            (delegation_amount, delegation_percentage, pool_address, updated_delegation.voting_deadline),
+        );
+    }
+
+    fn vote_yield_delegation(env: Env, user: Address, circle_id: u64, vote_choice: YieldVoteChoice) {
+        user.require_auth();
+
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No active yield delegation proposal");
+
+        if delegation.status != YieldDelegationStatus::Voting {
+            panic!("Yield delegation is not in voting period");
+        }
+
+        if env.ledger().timestamp() > delegation.voting_deadline {
+            delegation.status = YieldDelegationStatus::Rejected;
+            env.storage().instance().set(&delegation_key, &delegation);
+            panic!("Voting period has expired");
+        }
+
+        // Check if user is an active member
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .expect("User is not a member");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Check if already voted
+        let vote_key = DataKey::YieldVote(circle_id, user.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("Already voted");
+        }
+
+        // Record the vote
+        let vote = YieldVote {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: vote_choice.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update vote counts
+        match vote_choice {
+            YieldVoteChoice::For => delegation.for_votes += 1,
+            YieldVoteChoice::Against => delegation.against_votes += 1,
+        }
+        delegation.total_votes_cast += 1;
+
+        // Check if voting criteria are met
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        let active_members = count_active_members(&env, &circle);
+        
+        let quorum_met = (delegation.total_votes_cast * 100) >= (active_members * YIELD_QUORUM);
+        
+        if quorum_met && delegation.total_votes_cast > 0 {
+            let approval_percentage = (delegation.for_votes * 100) / delegation.total_votes_cast;
+            if approval_percentage >= YIELD_MAJORITY {
+                delegation.status = YieldDelegationStatus::Approved;
+            }
+        }
+
+        env.storage().instance().set(&delegation_key, &delegation);
+        write_audit(&env, &user, AuditAction::GovernanceVote, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_VOTE"), circle_id, user.clone()),
+            (vote_choice, delegation.for_votes, delegation.against_votes),
+        );
+    }
+
+    fn approve_yield_delegation(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation proposal found");
+
+        if delegation.status != YieldDelegationStatus::Approved {
+            panic!("Yield delegation is not approved");
+        }
+
+        // Register the yield pool if not already registered
+        let pool_registry_key = DataKey::YieldPoolRegistry;
+        let mut pool_registry: Vec<Address> = env.storage().instance().get(&pool_registry_key).unwrap_or(Vec::new(&env));
+        
+        if !pool_registry.contains(&delegation.pool_address) {
+            pool_registry.push_back(delegation.pool_address.clone());
+            env.storage().instance().set(&pool_registry_key, &pool_registry);
+        }
+
+        // Update pool info
+        let pool_info = YieldPoolInfo {
+            pool_address: delegation.pool_address.clone(),
+            pool_type: delegation.pool_type.clone(),
+            is_active: true,
+            total_delegated: delegation.delegation_amount,
+            apy_bps: 500, // Default 5% APY (would be fetched from pool)
+            last_updated: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&DataKey::YieldDelegation(circle_id), &pool_info);
+
+        // Execute the delegation
+        execute_yield_delegation_internal(&env, circle_id, &mut delegation);
+
+        env.storage().instance().set(&delegation_key, &delegation);
+        write_audit(&env, &env.current_contract_address(), AuditAction::AdminAction, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_APPROVED"), circle_id),
+            (delegation.delegation_amount, delegation.pool_address),
+        );
+    }
+
+    fn execute_yield_delegation(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation found");
+
+        if delegation.status != YieldDelegationStatus::Approved && delegation.status != YieldDelegationStatus::Active {
+            panic!("Yield delegation is not approved");
+        }
+
+        execute_yield_delegation_internal(&env, circle_id, &mut delegation);
+        env.storage().instance().set(&delegation_key, &delegation);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_EXECUTED"), circle_id),
+            (delegation.delegation_amount, delegation.pool_address),
+        );
+    }
+
+    fn compound_yield(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation found");
+
+        if delegation.status != YieldDelegationStatus::Active {
+            panic!("Yield delegation is not active");
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time < delegation.last_compound_time + YIELD_COMPOUNDING_FREQUENCY {
+            panic!("Too early to compound");
+        }
+
+        // Calculate yield (simplified - would query actual yield from pool)
+        let time_elapsed = current_time - delegation.last_compound_time;
+        let yield_earned = calculate_yield_from_pool(&env, &delegation, time_elapsed);
+
+        delegation.total_yield_earned += yield_earned;
+        delegation.last_compound_time = current_time;
+
+        env.storage().instance().set(&delegation_key, &delegation);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_COMPOUNDED"), circle_id),
+            (yield_earned, delegation.total_yield_earned),
+        );
+    }
+
+    fn withdraw_yield_delegation(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation found");
+
+        if delegation.status != YieldDelegationStatus::Active {
+            panic!("Yield delegation is not active");
+        }
+
+        // Final compound before withdrawal
+        let current_time = env.ledger().timestamp();
+        let time_elapsed = current_time - delegation.last_compound_time;
+        let final_yield = calculate_yield_from_pool(&env, &delegation, time_elapsed);
+        delegation.total_yield_earned += final_yield;
+
+        // Withdraw from pool (simplified - would call actual pool contract)
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        let token_client = token::Client::new(&env, &circle.token);
+        
+        // In real implementation, this would withdraw from the actual yield pool
+        let total_withdrawn = delegation.delegation_amount + delegation.total_yield_earned;
+        
+        // Return funds to contract
+        // token_client.transfer(&delegation.pool_address, &env.current_contract_address(), &total_withdrawn);
+
+        delegation.status = YieldDelegationStatus::Completed;
+        delegation.end_time = Some(current_time);
+
+        env.storage().instance().set(&delegation_key, &delegation);
+
+        // Distribute earnings
+        distribute_yield_earnings(env, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_WITHDRAWN"), circle_id),
+            (total_withdrawn, delegation.total_yield_earned),
+        );
+    }
+
+    fn distribute_yield_earnings(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation found");
+
+        if delegation.total_yield_earned <= delegation.yield_distributed {
+            panic!("No new yield to distribute");
+        }
+
+        let new_yield = delegation.total_yield_earned - delegation.yield_distributed;
+        
+        // Calculate 50/50 split
+        let recipient_share = (new_yield * YIELD_DISTRIBUTION_RECIPIENT_BPS as i128) / 10000;
+        let treasury_share = (new_yield * YIELD_DISTRIBUTION_TREASURY_BPS as i128) / 10000;
+
+        // Get current round recipient
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        if let Some(recipient) = &circle.current_pot_recipient {
+            // Transfer to current recipient
+            let token_client = token::Client::new(&env, &circle.token);
+            // token_client.transfer(&env.current_contract_address(), recipient, &recipient_share);
+        }
+
+        // Add to group treasury
+        let treasury_key = DataKey::GroupTreasury(circle_id);
+        let mut treasury: i128 = env.storage().instance().get(&treasury_key).unwrap_or(0);
+        treasury += treasury_share;
+        env.storage().instance().set(&treasury_key, &treasury);
+
+        // Update delegation record
+        let mut updated_delegation = delegation;
+        updated_delegation.yield_distributed += new_yield;
+        env.storage().instance().set(&delegation_key, &updated_delegation);
+
+        // Create distribution record
+        let distribution = YieldDistribution {
+            circle_id,
+            recipient_share,
+            treasury_share,
+            total_yield: new_yield,
+            distribution_time: env.ledger().timestamp(),
+            round_number: circle.current_recipient_index,
+        };
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DISTRIBUTED"), circle_id),
+            (recipient_share, treasury_share, new_yield),
+        );
+
+        write_audit(&env, &env.current_contract_address(), AuditAction::AdminAction, circle_id);
+    }
+}
+
+fn execute_yield_delegation_internal(env: &Env, circle_id: u64, delegation: &mut YieldDelegation) {
+    let current_time = env.ledger().timestamp();
+    
+    // Transfer funds to yield pool
+    let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+        .expect("Circle not found");
+    let token_client = token::Client::new(env, &circle.token);
+    
+    // In real implementation, this would call the actual yield pool contract
+    // token_client.transfer(&env.current_contract_address(), &delegation.pool_address, &delegation.delegation_amount);
+    
+    delegation.status = YieldDelegationStatus::Active;
+    delegation.start_time = Some(current_time);
+    delegation.last_compound_time = current_time;
+}
+
+fn calculate_yield_from_pool(env: &Env, delegation: &YieldDelegation, time_elapsed: u64) -> i128 {
+    // Simplified yield calculation - in real implementation would query actual pool
+    let apy_bps = 500; // 5% APY
+    let seconds_in_year = 365 * 24 * 60 * 60;
+    let time_fraction = time_elapsed as i128 * 10000 / seconds_in_year as i128;
+    (delegation.delegation_amount * apy_bps as i128 * time_fraction) / (10000 * 10000)
+}
+
     #[test]
     fn test_get_reputation() {
         let env = Env::default();
@@ -2048,5 +2540,141 @@ impl SoroSusuTrait for SoroSusu {
         std::panic::catch_unwind(|| {
             client.apply_rollover_bonus(&circle_id);
         }).expect_err("Should panic when trying to apply unapproved rollover");
+    }
+
+    #[test]
+    fn test_yield_delegation_proposal_and_voting() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Create circle with 3 members for higher quorum requirements
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000, // 1000 tokens
+            &3,
+            &token_contract,
+            &86400,
+            &100, // 1% insurance
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        client.join_circle(&user2, &circle_id, &1, &None);
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.deposit(&user2, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Start second cycle and finalize again
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.deposit(&user2, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        
+        // Propose yield delegation (50% of pot)
+        let pool_address = Address::generate(&env);
+        client.propose_yield_delegation(
+            &creator, 
+            &circle_id, 
+            &5000, // 50%
+            &pool_address,
+            &YieldPoolType::StellarLiquidityPool
+        );
+        
+        // Other members vote for the delegation
+        client.vote_yield_delegation(&user1, &circle_id, &YieldVoteChoice::For);
+        client.vote_yield_delegation(&user2, &circle_id, &YieldVoteChoice::For);
+        
+        // Approve and execute delegation
+        client.approve_yield_delegation(&circle_id);
+        client.execute_yield_delegation(&circle_id);
+        
+        // Test compounding
+        env.ledger().set_timestamp(env.ledger().timestamp() + YIELD_COMPOUNDING_FREQUENCY + 1);
+        client.compound_yield(&circle_id);
+        
+        // Test withdrawal and distribution
+        client.withdraw_yield_delegation(&circle_id);
+    }
+
+    #[test]
+    fn test_yield_delegation_rejection() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &2,
+            &token_contract,
+            &86400,
+            &100,
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Start second cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        
+        // Propose yield delegation
+        let pool_address = Address::generate(&env);
+        client.propose_yield_delegation(
+            &creator, 
+            &circle_id, 
+            &5000,
+            &pool_address,
+            &YieldPoolType::StellarLiquidityPool
+        );
+        
+        // Second member votes against - should not meet 80% majority
+        client.vote_yield_delegation(&user1, &circle_id, &YieldVoteChoice::Against);
+        
+        // Try to approve should fail since not approved
+        std::panic::catch_unwind(|| {
+            client.approve_yield_delegation(&circle_id);
+        }).expect_err("Should panic when trying to approve rejected delegation");
     }
 }
