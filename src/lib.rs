@@ -598,6 +598,7 @@ pub struct Member {
     pub last_contribution_time: u64,
     pub status: MemberStatus,
     pub tier_multiplier: u32,
+    pub shares: u32, // New field for shares (1 = standard, 2 = double contribution/payout)
     pub referrer: Option<Address>,
     pub buddy: Option<Address>,
 }
@@ -610,6 +611,7 @@ pub struct CircleInfo {
     pub contribution_amount: i128,
     pub max_members: u32,
     pub member_count: u32,
+    pub total_shares: u32, // Total shares in the circle (sum of all member shares)
     pub current_recipient_index: u32,
     pub is_active: bool,
     pub token: Address,
@@ -626,26 +628,18 @@ pub struct CircleInfo {
     pub requires_collateral: bool,
     pub collateral_bps: u32,
     pub member_addresses: Vec<Address>,
-    pub member_addresses: Vec<Address>,
-    pub requires_collateral: bool,
     pub leniency_enabled: bool,
     pub grace_period_end: Option<u64>,
     pub quadratic_voting_enabled: bool,
-    pub proposal_count: u64,
-    pub dissolution_status: DissolutionStatus,
-    pub dissolution_deadline: Option<u64>,
+    pub proposal_count: u32,
+    pub dissolution_status: u32,
+    pub dissolution_deadline: u64,
     pub proposed_late_fee_bps: u32,
     pub proposal_votes_bitmap: u64,
     pub recovery_old_address: Option<Address>,
     pub recovery_new_address: Option<Address>,
     pub recovery_votes_bitmap: u64,
-    pub quadratic_voting_enabled: bool,
     pub arbitrator: Address,
-    pub grace_period_end: u64,
-    pub proposal_count: u32,
-    pub leniency_enabled: bool,
-    pub dissolution_status: u32,
-    pub dissolution_deadline: u64,
 }
 
 // --- CONTRACT CLIENTS ---
@@ -714,6 +708,7 @@ pub trait SoroSusuTrait {
         user: Address,
         circle_id: u64,
         tier_multiplier: u32,
+        shares: u32, // New shares parameter (1 = standard, 2 = double)
         referrer: Option<Address>,
     );
     fn deposit(env: Env, user: Address, circle_id: u64);
@@ -820,7 +815,7 @@ fn calculate_rollover_bonus(env: &Env, circle_id: u64, fee_percentage_bps: u32) 
     let circle: CircleInfo = env.storage().instance().get(&circle_key)
         .expect("Circle not found");
     
-    let total_pot = circle.contribution_amount * (circle.member_count as i128);
+    let total_pot = circle.contribution_amount * (circle.total_shares as i128);
     
     // Calculate the platform fee that would be charged
     let platform_fee = (total_pot * fee_bps as i128) / 10000;
@@ -1154,6 +1149,7 @@ impl SoroSusuTrait for SoroSusu {
             contribution_amount: amount,
             max_members,
             member_count: 0,
+            total_shares: 0, // Initialize total shares
             current_recipient_index: 0,
             is_active: true,
             token,
@@ -1170,26 +1166,18 @@ impl SoroSusuTrait for SoroSusu {
             requires_collateral,
             collateral_bps,
             member_addresses: Vec::new(&env),
-            member_addresses: Vec::new(&env),
-            requires_collateral,
             leniency_enabled: true,
             grace_period_end: None,
             quadratic_voting_enabled: max_members >= MIN_GROUP_SIZE_FOR_QUADRATIC,
             proposal_count: 0,
-            dissolution_status: DissolutionStatus::NotInitiated,
-            dissolution_deadline: None,
+            dissolution_status: 0,
+            dissolution_deadline: 0,
             proposed_late_fee_bps: 0,
             proposal_votes_bitmap: 0,
             recovery_old_address: None,
             recovery_new_address: None,
             recovery_votes_bitmap: 0,
-            quadratic_voting_enabled: max_members >= MIN_GROUP_SIZE_FOR_QUADRATIC,
             arbitrator,
-            grace_period_end: 0,
-            proposal_count: 0,
-            leniency_enabled: true,
-            dissolution_status: 0,
-            dissolution_deadline: 0,
         };
 
         env.storage()
@@ -1204,6 +1192,7 @@ impl SoroSusuTrait for SoroSusu {
         user: Address,
         circle_id: u64,
         tier_multiplier: u32,
+        shares: u32, // New shares parameter (1 = standard, 2 = double)
         referrer: Option<Address>,
     ) {
         user.require_auth();
@@ -1215,6 +1204,11 @@ impl SoroSusuTrait for SoroSusu {
             .expect("Circle not found");
         if circle.member_count >= circle.max_members {
             panic!("Circle is full");
+        }
+
+        // Validate shares parameter (must be 1 or 2)
+        if shares != 1 && shares != 2 {
+            panic!("Shares must be either 1 (standard) or 2 (double)");
         }
 
         let member_key = DataKey::Member(user.clone());
@@ -1243,7 +1237,8 @@ impl SoroSusuTrait for SoroSusu {
             contribution_count: 0,
             last_contribution_time: 0,
             status: MemberStatus::Active,
-            tier_multiplier,
+            tier_multiplier: shares, // Set tier_multiplier equal to shares for backward compatibility
+            shares,
             referrer,
             buddy: None,
         };
@@ -1251,6 +1246,7 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&member_key, &new_member);
         env.storage().instance().set(&DataKey::CircleMember(circle_id, circle.member_count), &user);
         circle.member_count += 1;
+        circle.total_shares += shares; // Update total shares
         circle.member_addresses.push_back(user.clone());
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
 
@@ -1450,10 +1446,21 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Payout too early");
         }
 
-        let pot_amount = circle.contribution_amount * (circle.member_count as i128);
+        // Get member info to check shares
+        let member_key = DataKey::Member(user.clone());
+        let member_info: Member = env.storage().instance().get(&member_key)
+            .expect("Member not found");
+
+        // Calculate pot amount based on total shares, not member count
+        let pot_amount = circle.contribution_amount * (circle.total_shares as i128);
+        
+        // Apply shares multiplier to payout (double payout for 2 shares)
+        let mut total_payout = pot_amount;
+        if member_info.shares == 2 {
+            total_payout = pot_amount * 2; // Double payout for 2 shares
+        }
         
         // Check for rollover bonus and add to first pot of new cycles
-        let mut total_payout = pot_amount;
         let rollover_key = DataKey::RolloverBonus(circle_id);
         if let Some(rollover_bonus) = env.storage().instance().get::<DataKey, RolloverBonus>(&rollover_key) {
             if rollover_bonus.status == RolloverStatus::Applied {
@@ -2126,7 +2133,7 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         let current_time = env.ledger().timestamp();
-        let pot_amount = circle.contribution_amount * (circle.member_count as i128);
+        let pot_amount = circle.contribution_amount * (circle.total_shares as i128);
         let delegation_amount = (pot_amount * delegation_percentage as i128) / 10000;
 
         if delegation_amount < MIN_DELEGATION_AMOUNT {
