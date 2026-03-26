@@ -26,7 +26,15 @@ pub enum Error {
     InsufficientInsurance = 12,
     InsuranceAlreadyUsed = 13,
     RateLimitExceeded = 14,
-
+    // Vesting-Vault Lien Errors
+    LienNotFound = 15,
+    LienAlreadyExists = 16,
+    InsufficientVestingBalance = 17,
+    VestingVaultNotFound = 18,
+    LienNotActive = 19,
+    VestingPeriodExpired = 20,
+    InvalidVestingContract = 21,
+    LienAmountExceedsVesting = 22,
 }
 
 // --- CONSTANTS ---
@@ -69,6 +77,11 @@ const PATH_PAYMENT_MAJORITY: u32 = 66; // 66% majority for path payment approval
 const MAX_SLIPPAGE_TOLERANCE_BPS: u32 = 500; // 5% maximum slippage tolerance
 const MIN_PATH_PAYMENT_AMOUNT: i128 = 50_000_000; // Minimum 5 tokens for path payment
 const PATH_PAYMENT_TIMEOUT: u64 = 300; // 5 minutes timeout for path payment execution
+
+// Vesting-Vault Lien Constants
+const MAX_LEEN_PERCENTAGE: u32 = 8000; // Maximum 80% of vesting can be liened
+const LIEN_VERIFICATION_TIMEOUT: u64 = 300; // 5 minutes for vesting vault verification
+const MIN_VESTING_REMAINING: u64 = 604800; // Minimum 7 days remaining vesting required
 
 // --- DATA STRUCTURES ---
 
@@ -122,6 +135,8 @@ pub enum DataKey {
     PathPaymentVote(u64, Address),
     DexRegistry,
     SupportedTokens,
+    VestingVaultLien(Address, u64), // (member, circle_id)
+    LienRegistry(u64), // circle_id -> Vec<LienInfo>
 }
 
 #[contracttype]
@@ -589,6 +604,44 @@ pub struct CollateralInfo {
     pub release_timestamp: Option<u64>,
 }
 
+// --- VESTING-VAULT LIEN DATA STRUCTURES ---
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LienStatus {
+    Active,     // Lien is currently active
+    Claimed,    // Funds have been claimed due to default
+    Released,   // Lien released after successful completion
+    Expired,    // Lien expired (vesting period ended)
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingVaultLienInfo {
+    pub member: Address,
+    pub circle_id: u64,
+    pub vesting_vault_contract: Address,
+    pub lien_amount: i128,        // Amount of future vesting locked
+    pub original_vesting_amount: i128, // Total vesting amount at lien creation
+    pub status: LienStatus,
+    pub created_timestamp: u64,
+    pub claim_timestamp: Option<u64>,
+    pub release_timestamp: Option<u64>,
+    pub vesting_end_timestamp: u64, // When vesting period ends
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LienInfo {
+    pub lien_id: u64,
+    pub member: Address,
+    pub circle_id: u64,
+    pub vault_contract: Address,
+    pub amount: i128,
+    pub status: LienStatus,
+    pub created_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Member {
@@ -657,6 +710,9 @@ pub enum AuditAction {
     GovernanceVote,
     EvidenceAccess,
     AdminAction,
+    CreateLien,
+    ClaimLien,
+    ReleaseLien,
 }
 
 #[contracttype]
@@ -738,6 +794,8 @@ pub trait SoroSusuTrait {
 
     fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address);
 
+    fn mark_member_defaulted(env: Env, caller: Address, circle_id: u64, member: Address);
+
     fn pair_with_member(env: Env, user: Address, buddy_address: Address);
     fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: i128);
 
@@ -765,6 +823,42 @@ pub trait SoroSusuTrait {
 
     // Inter-contract reputation query interface
     fn get_reputation(env: Env, user: Address) -> ReputationData;
+
+    // --- VESTING-VAULT LIEN FUNCTIONS ---
+    
+    // Create a lien on member's future vesting tokens
+    fn create_vesting_lien(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        vesting_vault_contract: Address,
+        lien_amount: i128,
+    ) -> u64;
+    
+    // Claim lien funds when member defaults
+    fn claim_vesting_lien(
+        env: Env,
+        caller: Address,
+        circle_id: u64,
+        member: Address,
+    );
+    
+    // Release lien after successful completion
+    fn release_vesting_lien(
+        env: Env,
+        caller: Address,
+        circle_id: u64,
+        member: Address,
+    );
+    
+    // Get lien information for a member
+    fn get_vesting_lien(env: Env, member: Address, circle_id: u64) -> Option<VestingVaultLienInfo>;
+    
+    // Get all liens for a circle
+    fn get_circle_liens(env: Env, circle_id: u64) -> Vec<LienInfo>;
+    
+    // Verify vesting vault compatibility (called by SoroSusu)
+    fn verify_vesting_vault(env: Env, vault_contract: Address) -> bool;
 }
 
 // --- IMPLEMENTATION ---
@@ -1227,13 +1321,34 @@ impl SoroSusuTrait for SoroSusu {
             let collateral_key = DataKey::CollateralVault(user.clone(), circle_id);
             let collateral_info: Option<CollateralInfo> = env.storage().instance().get(&collateral_key);
             
+            // Check for traditional collateral first
             match collateral_info {
                 Some(collateral) => {
                     if collateral.status != CollateralStatus::Staked {
                         panic!("Collateral not properly staked");
                     }
                 }
-                None => panic!("Collateral required for this circle"),
+                None => {
+                    // If no traditional collateral, check for Vesting-Vault lien
+                    let lien_key = DataKey::VestingVaultLien(user.clone(), circle_id);
+                    let lien_info: Option<VestingVaultLienInfo> = env.storage().instance().get(&lien_key);
+                    
+                    match lien_info {
+                        Some(lien) => {
+                            if lien.status != LienStatus::Active {
+                                panic!("Vesting lien is not active");
+                            }
+                            // Verify lien amount is sufficient (at least 20% of total contribution)
+                            let total_contribution_value = circle.contribution_amount * circle.max_members as i128;
+                            let required_lien_amount = (total_contribution_value * DEFAULT_COLLATERAL_BPS as i128) / 10000;
+                            
+                            if lien.lien_amount < required_lien_amount {
+                                panic!("Vesting lien amount insufficient");
+                            }
+                        }
+                        None => panic!("Collateral or Vesting lien required for this circle"),
+                    }
+                }
             }
         }
 
@@ -1488,6 +1603,7 @@ impl SoroSusuTrait for SoroSusu {
             let member_key = DataKey::Member(user.clone());
             if let Some(member_info) = env.storage().instance().get::<DataKey, Member>(&member_key) {
                 if member_info.contribution_count >= circle.max_members {
+                    // Check for traditional collateral first
                     let collateral_key = DataKey::CollateralVault(user.clone(), circle_id);
                     if let Some(mut collateral_info) = env.storage().instance().get::<DataKey, CollateralInfo>(&collateral_key) {
                         if collateral_info.status == CollateralStatus::Staked {
@@ -1498,6 +1614,33 @@ impl SoroSusuTrait for SoroSusu {
                             collateral_info.status = CollateralStatus::Released;
                             collateral_info.release_timestamp = Some(env.ledger().timestamp());
                             env.storage().instance().set(&collateral_key, &collateral_info);
+                        }
+                    }
+                    
+                    // Check for Vesting-Vault lien and auto-release
+                    let lien_key = DataKey::VestingVaultLien(user.clone(), circle_id);
+                    if let Some(mut lien_info) = env.storage().instance().get::<DataKey, VestingVaultLienInfo>(&lien_key) {
+                        if lien_info.status == LienStatus::Active {
+                            // Release lien
+                            lien_info.status = LienStatus::Released;
+                            lien_info.release_timestamp = Some(env.ledger().timestamp());
+                            env.storage().instance().set(&lien_key, &lien_info);
+                            
+                            // Update circle registry
+                            let registry_key = DataKey::LienRegistry(circle_id);
+                            let mut circle_liens: Vec<LienInfo> = env.storage().instance().get(&registry_key)
+                                .unwrap_or(Vec::new(&env));
+                            
+                            for lien in circle_liens.iter_mut() {
+                                if lien.member == user && lien.circle_id == circle_id {
+                                    lien.status = LienStatus::Released;
+                                    break;
+                                }
+                            }
+                            env.storage().instance().set(&registry_key, &circle_liens);
+                            
+                            // Log audit entry
+                            write_audit(&env, &user, AuditAction::ReleaseLien, circle_id);
                         }
                     }
                 }
@@ -1784,6 +1927,85 @@ impl SoroSusuTrait for SoroSusu {
         write_audit(&env, &caller, AuditAction::AdminAction, circle_id);
     }
 
+    fn mark_member_defaulted(env: Env, caller: Address, circle_id: u64, member: Address) {
+        caller.require_auth();
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("Admin not set");
+        
+        if caller != circle.creator && caller != admin {
+            panic!("Unauthorized to mark member as defaulted");
+        }
+
+        let member_key = DataKey::Member(member.clone());
+        let mut member_info: Member = env
+            .storage()
+            .instance()
+            .get(&member_key)
+            .expect("Member not found");
+
+        member_info.status = MemberStatus::Defaulted;
+        env.storage().instance().set(&member_key, &member_info);
+
+        // Add to defaulted members list
+        let defaulted_key = DataKey::DefaultedMembers(circle_id);
+        let mut defaulted_members: Vec<Address> = env.storage().instance().get(&defaulted_key)
+            .unwrap_or(Vec::new(&env));
+        defaulted_members.push_back(member.clone());
+        env.storage().instance().set(&defaulted_key, &defaulted_members);
+
+        // Automatically claim any Vesting-Vault lien
+        let lien_key = DataKey::VestingVaultLien(member.clone(), circle_id);
+        if let Some(mut lien_info) = env.storage().instance().get::<DataKey, VestingVaultLienInfo>(&lien_key) {
+            if lien_info.status == LienStatus::Active {
+                // Update lien status to claimed
+                lien_info.status = LienStatus::Claimed;
+                lien_info.claim_timestamp = Some(env.ledger().timestamp());
+                env.storage().instance().set(&lien_key, &lien_info);
+
+                // Update circle registry
+                let registry_key = DataKey::LienRegistry(circle_id);
+                let mut circle_liens: Vec<LienInfo> = env.storage().instance().get(&registry_key)
+                    .unwrap_or(Vec::new(&env));
+                
+                for lien in circle_liens.iter_mut() {
+                    if lien.member == member && lien.circle_id == circle_id {
+                        lien.status = LienStatus::Claimed;
+                        break;
+                    }
+                }
+                env.storage().instance().set(&registry_key, &circle_liens);
+
+                // In a real implementation, this would trigger the cross-contract call
+                // to the Vesting-Vault to actually claim the funds
+                // For now, we'll just log the claim
+                
+                // Log audit entry
+                write_audit(&env, &caller, AuditAction::ClaimLien, circle_id);
+            }
+        }
+
+        // Also handle traditional collateral if present
+        let collateral_key = DataKey::CollateralVault(member.clone(), circle_id);
+        if let Some(mut collateral_info) = env.storage().instance().get::<DataKey, CollateralInfo>(&collateral_key) {
+            if collateral_info.status == CollateralStatus::Staked {
+                // Slash collateral and transfer to group reserve
+                let token_client = token::Client::new(&env, &circle.token);
+                token_client.transfer(&env.current_contract_address(), &circle.creator, &collateral_info.amount);
+                
+                collateral_info.status = CollateralStatus::Slashed;
+                env.storage().instance().set(&collateral_key, &collateral_info);
+            }
+        }
+
+        write_audit(&env, &caller, AuditAction::AdminAction, circle_id);
+    }
+
     fn pair_with_member(env: Env, user: Address, buddy_address: Address) {
         user.require_auth();
         let user_key = DataKey::Member(user.clone());
@@ -1916,6 +2138,222 @@ impl SoroSusuTrait for SoroSusu {
             last_updated: current_time,
             is_active,
         }
+    }
+
+    // --- VESTING-VAULT LIEN IMPLEMENTATION ---
+
+    fn create_vesting_lien(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        vesting_vault_contract: Address,
+        lien_amount: i128,
+    ) -> u64 {
+        user.require_auth();
+
+        // Verify circle exists
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        // Check if lien already exists
+        let existing_lien_key = DataKey::VestingVaultLien(user.clone(), circle_id);
+        if let Some(_existing_lien) = env.storage().instance().get::<DataKey, VestingVaultLienInfo>(&existing_lien_key) {
+            panic!("Lien already exists for this member and circle");
+        }
+
+        // Verify vesting vault compatibility
+        if !Self::verify_vesting_vault(env.clone(), vesting_vault_contract.clone()) {
+            panic!("Invalid vesting vault contract");
+        }
+
+        // Get vesting information from vault contract
+        // This would involve a cross-contract call to the vesting vault
+        // For now, we'll simulate the verification
+        let current_time = env.ledger().timestamp();
+        
+        // Create lien record
+        let lien_info = VestingVaultLienInfo {
+            member: user.clone(),
+            circle_id,
+            vesting_vault_contract: vesting_vault_contract.clone(),
+            lien_amount,
+            original_vesting_amount: lien_amount, // Simplified - should get from vault
+            status: LienStatus::Active,
+            created_timestamp: current_time,
+            claim_timestamp: None,
+            release_timestamp: None,
+            vesting_end_timestamp: current_time + MIN_VESTING_REMAINING,
+        };
+
+        // Store individual lien
+        env.storage().instance().set(&existing_lien_key, &lien_info);
+
+        // Add to circle's lien registry
+        let registry_key = DataKey::LienRegistry(circle_id);
+        let mut circle_liens: Vec<LienInfo> = env.storage().instance().get(&registry_key).unwrap_or(Vec::new(&env));
+        
+        let lien_id = circle_liens.len() as u64 + 1;
+        let lien_summary = LienInfo {
+            lien_id,
+            member: user.clone(),
+            circle_id,
+            vault_contract: vesting_vault_contract,
+            amount: lien_amount,
+            status: LienStatus::Active,
+            created_at: current_time,
+        };
+        
+        circle_liens.push_back(lien_summary);
+        env.storage().instance().set(&registry_key, &circle_liens);
+
+        // Log audit entry
+        write_audit(&env, &user, AuditAction::CreateLien, circle_id);
+
+        lien_id
+    }
+
+    fn claim_vesting_lien(
+        env: Env,
+        caller: Address,
+        circle_id: u64,
+        member: Address,
+    ) {
+        // Authorize caller (circle creator or admin)
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("Admin not set");
+        
+        if caller != circle.creator && caller != admin {
+            panic!("Unauthorized to claim lien");
+        }
+
+        // Get lien information
+        let lien_key = DataKey::VestingVaultLien(member.clone(), circle_id);
+        let mut lien_info: VestingVaultLienInfo = env.storage().instance().get(&lien_key)
+            .expect("Lien not found");
+
+        if lien_info.status != LienStatus::Active {
+            panic!("Lien is not active");
+        }
+
+        // Check if member is defaulted
+        let member_key = DataKey::Member(member.clone());
+        let member_info: Member = env.storage().instance().get(&member_key)
+            .expect("Member not found");
+
+        if member_info.status != MemberStatus::Defaulted {
+            panic!("Can only claim lien for defaulted members");
+        }
+
+        // In a real implementation, this would make a cross-contract call
+        // to the vesting vault to claim the funds
+        // For now, we'll simulate the claim
+        
+        // Update lien status
+        lien_info.status = LienStatus::Claimed;
+        lien_info.claim_timestamp = Some(env.ledger().timestamp());
+        env.storage().instance().set(&lien_key, &lien_info);
+
+        // Update circle registry
+        let registry_key = DataKey::LienRegistry(circle_id);
+        let mut circle_liens: Vec<LienInfo> = env.storage().instance().get(&registry_key)
+            .expect("Lien registry not found");
+        
+        // Update the corresponding lien in registry
+        for lien in circle_liens.iter_mut() {
+            if lien.member == member && lien.circle_id == circle_id {
+                lien.status = LienStatus::Claimed;
+                break;
+            }
+        }
+        env.storage().instance().set(&registry_key, &circle_liens);
+
+        // Log audit entry
+        write_audit(&env, &caller, AuditAction::ClaimLien, circle_id);
+    }
+
+    fn release_vesting_lien(
+        env: Env,
+        caller: Address,
+        circle_id: u64,
+        member: Address,
+    ) {
+        // Authorize caller (member, circle creator, or admin)
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("Admin not set");
+        
+        if caller != member && caller != circle.creator && caller != admin {
+            panic!("Unauthorized to release lien");
+        }
+
+        // Get lien information
+        let lien_key = DataKey::VestingVaultLien(member.clone(), circle_id);
+        let mut lien_info: VestingVaultLienInfo = env.storage().instance().get(&lien_key)
+            .expect("Lien not found");
+
+        if lien_info.status != LienStatus::Active {
+            panic!("Lien is not active");
+        }
+
+        // Check if member has completed all obligations
+        let member_key = DataKey::Member(member.clone());
+        let member_info: Member = env.storage().instance().get(&member_key)
+            .expect("Member not found");
+
+        // Member can only release lien if they've completed all contributions
+        // and haven't defaulted
+        if member_info.status != MemberStatus::Active {
+            panic!("Cannot release lien for non-active members");
+        }
+
+        // Update lien status
+        lien_info.status = LienStatus::Released;
+        lien_info.release_timestamp = Some(env.ledger().timestamp());
+        env.storage().instance().set(&lien_key, &lien_info);
+
+        // Update circle registry
+        let registry_key = DataKey::LienRegistry(circle_id);
+        let mut circle_liens: Vec<LienInfo> = env.storage().instance().get(&registry_key)
+            .expect("Lien registry not found");
+        
+        // Update the corresponding lien in registry
+        for lien in circle_liens.iter_mut() {
+            if lien.member == member && lien.circle_id == circle_id {
+                lien.status = LienStatus::Released;
+                break;
+            }
+        }
+        env.storage().instance().set(&registry_key, &circle_liens);
+
+        // Log audit entry
+        write_audit(&env, &caller, AuditAction::ReleaseLien, circle_id);
+    }
+
+    fn get_vesting_lien(env: Env, member: Address, circle_id: u64) -> Option<VestingVaultLienInfo> {
+        let lien_key = DataKey::VestingVaultLien(member, circle_id);
+        env.storage().instance().get(&lien_key)
+    }
+
+    fn get_circle_liens(env: Env, circle_id: u64) -> Vec<LienInfo> {
+        let registry_key = DataKey::LienRegistry(circle_id);
+        env.storage().instance().get(&registry_key).unwrap_or(Vec::new(&env))
+    }
+
+    fn verify_vesting_vault(env: Env, vault_contract: Address) -> bool {
+        // In a real implementation, this would verify that the vault contract
+        // implements the expected interface for lien operations
+        // For now, we'll return true as a placeholder
+        // This could involve checking if the contract has specific functions
+        // or if it's in a registry of approved vault contracts
+        
+        // Placeholder verification logic
+        // You might want to maintain a registry of approved vault contracts
+        true
     }
 
     fn propose_rollover_bonus(env: Env, user: Address, circle_id: u64, fee_percentage_bps: u32) {
