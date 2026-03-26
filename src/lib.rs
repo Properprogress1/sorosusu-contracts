@@ -30,6 +30,8 @@ pub enum DataKey {
     ClawbackDeficit(u64), // circle_id -> deficit amount
     RecoveryPlan(u64),    // circle_id -> recovery plan
     PausedRounds(u64),    // circle_id -> pause info
+    // Group Lead Commission Keys
+    MemberByIndex(u64, u32), // circle_id -> member_index -> member_address
 }
 
 #[contracttype]
@@ -67,6 +69,7 @@ pub struct CircleInfo {
     pub cycle_count: u32, // Track completed cycles for vesting
     pub is_paused: bool, // Pause state for clawback events
     pub expected_balance: u64, // Expected token balance for deficit detection
+    pub organizer_fee_bps: u32, // Commission for group creator in basis points (1% = 100 bps)
 }
 
 #[contracttype]
@@ -156,9 +159,10 @@ pub enum PauseReason {
 
 pub trait SoroSusuTrait {
     fn init(env: Env, admin: Address);
-    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64;
+    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address, organizer_fee_bps: u32) -> u64;
     fn join_circle(env: Env, user: Address, circle_id: u64);
     fn deposit(env: Env, user: Address, circle_id: u64);
+    fn distribute_payout(env: Env, caller: Address, circle_id: u64);
     fn trigger_insurance_coverage(env: Env, caller: Address, circle_id: u64, member: Address);
     fn propose_penalty_change(env: Env, user: Address, circle_id: u64, new_bps: u32);
     fn vote_penalty_change(env: Env, user: Address, circle_id: u64);
@@ -221,7 +225,7 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::TotalMinedTokens, &0u64);
     }
 
-    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64 {
+    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address, organizer_fee_bps: u32) -> u64 {
         let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
         circle_count += 1;
 
@@ -231,6 +235,10 @@ impl SoroSusuTrait for SoroSusu {
 
         if insurance_fee_bps > 10000 {
             panic!("Insurance fee cannot exceed 100%");
+        }
+
+        if organizer_fee_bps > 10000 {
+            panic!("Organizer fee cannot exceed 100%");
         }
 
         let current_time = env.ledger().timestamp();
@@ -257,6 +265,7 @@ impl SoroSusuTrait for SoroSusu {
             cycle_count: 0,
             is_paused: false,
             expected_balance: 0,
+            organizer_fee_bps,
         };
 
         env.storage().instance().set(&DataKey::Circle(circle_count), &new_circle);
@@ -292,6 +301,11 @@ impl SoroSusuTrait for SoroSusu {
         };
         
         env.storage().instance().set(&member_key, &new_member);
+        
+        // Store member address by index for efficient lookup
+        let member_by_index_key = DataKey::MemberByIndex(circle_id, new_member.index);
+        env.storage().instance().set(&member_by_index_key, &user);
+        
         circle.member_count += 1;
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
 
@@ -384,6 +398,77 @@ impl SoroSusuTrait for SoroSusu {
 
         // Check if cycle is complete and trigger payout/mining release
         Self::check_and_complete_cycle(env.clone(), circle_id);
+    }
+
+    fn distribute_payout(env: Env, caller: Address, circle_id: u64) {
+        caller.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        
+        // Check if round is paused
+        if circle.is_paused {
+            panic!("Round is paused due to clawback detection");
+        }
+
+        // Check if all members have contributed for this cycle
+        let required_contributions = circle.member_count;
+        let current_contributions = circle.contribution_bitmap.count_ones() as u16;
+        
+        if current_contributions < required_contributions {
+            panic!("Not all members have contributed this cycle");
+        }
+
+        // Check if payout has already been processed for this cycle
+        if (circle.payout_bitmap & (1 << circle.current_recipient_index)) != 0 {
+            panic!("Payout already processed for this recipient this cycle");
+        }
+
+        // Calculate payout amount
+        let base_payout_amount = circle.contribution_amount * circle.member_count as u64;
+        let commission_amount = (base_payout_amount * circle.organizer_fee_bps as u64) / 10000;
+        let net_payout_amount = base_payout_amount - commission_amount;
+
+        let token_client = token::Client::new(&env, &circle.token);
+
+        // Transfer commission to organizer if applicable
+        if commission_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &circle.creator, &commission_amount);
+            
+            // Emit commission event
+            env.events().publish(
+                (Symbol::short("commission_paid"), circle_id, circle.creator.clone()),
+                commission_amount,
+            );
+        }
+
+        // Find the current recipient
+        let recipient_address = Self::get_current_recipient(env.clone(), circle_id);
+        
+        // Transfer net payout to recipient
+        token_client.transfer(&env.current_contract_address(), &recipient_address, &net_payout_amount);
+
+        // Mark payout as processed
+        circle.payout_bitmap |= 1 << circle.current_recipient_index;
+        
+        // Move to next recipient
+        circle.current_recipient_index = (circle.current_recipient_index + 1) % circle.member_count;
+        
+        // If we've completed a full round, reset payout bitmap and increment cycle
+        if circle.current_recipient_index == 0 {
+            circle.payout_bitmap = 0;
+            circle.cycle_count += 1;
+            circle.contribution_bitmap = 0; // Reset for next cycle
+            circle.is_insurance_used = false;
+            circle.deadline_timestamp = env.ledger().timestamp() + circle.cycle_duration;
+        }
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // Emit payout event
+        env.events().publish(
+            (Symbol::short("payout_distributed"), circle_id, recipient_address),
+            net_payout_amount,
+        );
     }
 
     fn set_governance_token(env: Env, admin: Address, token_address: Address) {
@@ -610,6 +695,10 @@ impl SoroSusuTrait for SoroSusu {
 
         member_info.is_active = false;
         env.storage().instance().set(&member_key, &member_info);
+
+        // Remove member address by index mapping
+        let member_by_index_key = DataKey::MemberByIndex(circle_id, member_info.index);
+        env.storage().instance().remove(&member_by_index_key);
 
         // Deactivate vesting
         let vesting_key = DataKey::UserVesting(member.clone());
@@ -947,6 +1036,16 @@ impl SoroSusuTrait for SoroSusu {
 // --- PRIVATE HELPER FUNCTIONS ---
 
 impl SoroSusu {
+    fn get_current_recipient(env: Env, circle_id: u64) -> Address {
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        
+        let current_recipient_index = circle.current_recipient_index;
+        let member_by_index_key = DataKey::MemberByIndex(circle_id, current_recipient_index as u32);
+        
+        env.storage().instance().get(&member_by_index_key)
+            .unwrap_or_else(|| panic!("Member not found at index {}", current_recipient_index))
+    }
+
     fn mine_governance_tokens(env: Env, user: Address, circle_id: u64, circle: &mut CircleInfo, member: &mut Member) {
         let config: MiningConfig = env.storage().instance().get(&DataKey::MiningConfig).unwrap();
         
@@ -1082,3 +1181,6 @@ impl SoroSusu {
 // --- TESTS ---
 #[cfg(test)]
 mod clawback_tests;
+
+#[cfg(test)]
+mod commission_tests;
