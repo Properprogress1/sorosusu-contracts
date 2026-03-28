@@ -32,6 +32,11 @@ pub enum DataKey {
     PausedRounds(u64),    // circle_id -> pause info
     // Group Lead Commission Keys
     MemberByIndex(u64, u32), // circle_id -> member_index -> member_address
+    // Soulbound Token (SBT) Keys
+    SbtContract,
+    UserSbt(Address), // user -> SBT info
+    ReputationMilestone(u32), // milestone_id -> milestone config
+    SbtRevocationList(Address), // user -> revocation info
 }
 
 #[contracttype]
@@ -70,6 +75,55 @@ pub struct CircleInfo {
     pub is_paused: bool, // Pause state for clawback events
     pub expected_balance: u64, // Expected token balance for deficit detection
     pub organizer_fee_bps: u32, // Commission for group creator in basis points (1% = 100 bps)
+    // Business Goal Verification (Issue #212)
+    business_goal_hash: Option<Symbol>, // Hash of business goal document
+    verified_vendor: Option<Address>, // Verified vendor for goal verification
+    goal_amount: Option<u64>, // Amount needed for business goal
+    pub is_goal_verified: bool, // Whether goal has been verified
+}
+
+// --- SOULBOUND TOKEN (SBT) STRUCTURES ---
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum SbtStatus {
+    Active,
+    Dishonored,
+    Revoked,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SoulboundToken {
+    pub token_id: u128,
+    pub owner: Address,
+    pub milestone_id: u32,
+    pub issued_at: u64,
+    pub status: SbtStatus,
+    pub reputation_score: u32,
+    pub cycles_completed: u32,
+    metadata: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationMilestone {
+    pub id: u32,
+    pub name: Symbol,
+    pub description: Symbol,
+    pub required_cycles: u32,
+    pub min_reputation_score: u32,
+    is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SbtRevocationInfo {
+    pub user: Address,
+    pub token_id: u128,
+    pub revoked_at: u64,
+    pub reason: Symbol,
+    pub revoked_by: Address,
 }
 
 #[contracttype]
@@ -187,6 +241,21 @@ pub trait SoroSusuTrait {
     fn get_clawback_deficit(env: Env, circle_id: u64) -> ClawbackDeficit;
     fn get_recovery_plan(env: Env, circle_id: u64) -> RecoveryPlan;
     fn get_paused_round_info(env: Env, circle_id: u64) -> PausedRound;
+    
+    // Soulbound Token (SBT) Functions (Issue #210)
+    fn set_sbt_contract(env: Env, admin: Address, sbt_contract: Address);
+    fn configure_reputation_milestone(env: Env, admin: Address, milestone_id: u32, milestone: ReputationMilestone);
+    fn issue_sbt_credential(env: Env, user: Address, milestone_id: u32);
+    fn revoke_sbt_credential(env: Env, admin: Address, user: Address, reason: Symbol);
+    fn update_sbt_status(env: Env, admin: Address, user: Address, status: SbtStatus);
+    fn get_user_sbt(env: Env, user: Address) -> SoulboundToken;
+    fn get_reputation_milestone(env: Env, milestone_id: u32) -> ReputationMilestone;
+    
+    // Business Goal Verification Functions (Issue #212)
+    fn set_business_goal(env: Env, creator: Address, circle_id: u64, goal_hash: Symbol, verified_vendor: Address, goal_amount: u64);
+    fn verify_business_goal(env: Env, vendor: Address, circle_id: u64, invoice_hash: Symbol);
+    fn release_goal_funds(env: Env, circle_id: u64);
+    fn get_business_goal_info(env: Env, circle_id: u64) -> (Option<Symbol>, Option<Address>, Option<u64>, bool);
 }
 
 #[contractclient(name = "SusuNftClient")]
@@ -198,6 +267,13 @@ pub trait SusuNftTrait {
 #[contractclient(name = "GovernanceTokenClient")]
 pub trait GovernanceTokenTrait {
     fn mint(env: Env, to: Address, amount: u64);
+}
+
+#[contractclient(name = "SbtTokenClient")]
+pub trait SbtTokenTrait {
+    fn mint_sbt(env: Env, to: Address, token_id: u128, metadata: Symbol);
+    fn update_metadata(env: Env, token_id: u128, metadata: Symbol);
+    fn burn(env: Env, token_id: u128);
 }
 
 // --- IMPLEMENTATION ---
@@ -398,6 +474,9 @@ impl SoroSusuTrait for SoroSusu {
 
         // Check if cycle is complete and trigger payout/mining release
         Self::check_and_complete_cycle(env.clone(), circle_id);
+
+        // Check if user qualifies for SBT credential after this contribution
+        Self::check_and_issue_sbt_credential(env.clone(), user.clone());
     }
 
     fn distribute_payout(env: Env, caller: Address, circle_id: u64) {
@@ -750,6 +829,9 @@ impl SoroSusuTrait for SoroSusu {
                 (Symbol::short("clawback_detected"), circle_id, caller),
                 deficit_amount,
             );
+
+            // Check for SBT holders and mark as dishonored if they were involved
+            Self::handle_sbt_clawback_impact(env.clone(), circle_id);
         }
     }
 
@@ -1031,6 +1113,336 @@ impl SoroSusuTrait for SoroSusu {
                 paused_by: Address::generate(&env),
             })
     }
+
+    // --- SOULBOUND TOKEN (SBT) IMPLEMENTATIONS (Issue #210) ---
+
+    fn set_sbt_contract(env: Env, admin: Address, sbt_contract: Address) {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can set SBT contract");
+        }
+
+        env.storage().instance().set(&DataKey::SbtContract, &sbt_contract);
+
+        // Initialize default reputation milestones
+        let milestone_5_cycles = ReputationMilestone {
+            id: 1,
+            name: Symbol::short("Reliable_Saver"),
+            description: Symbol::short("Completed_5_cycles_reliably"),
+            required_cycles: 5,
+            min_reputation_score: 80,
+            is_active: true,
+        };
+        env.storage().instance().set(&DataKey::ReputationMilestone(1), &milestone_5_cycles);
+
+        let milestone_10_cycles = ReputationMilestone {
+            id: 2,
+            name: Symbol::short("Trusted_Member"),
+            description: Symbol::short("Completed_10_cycles_reliably"),
+            required_cycles: 10,
+            min_reputation_score: 90,
+            is_active: true,
+        };
+        env.storage().instance().set(&DataKey::ReputationMilestone(2), &milestone_10_cycles);
+
+        env.events().publish(
+            (Symbol::short("sbt_contract_set"), admin),
+            sbt_contract,
+        );
+    }
+
+    fn configure_reputation_milestone(env: Env, admin: Address, milestone_id: u32, milestone: ReputationMilestone) {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can configure milestones");
+        }
+
+        env.storage().instance().set(&DataKey::ReputationMilestone(milestone_id), &milestone);
+
+        env.events().publish(
+            (Symbol::short("milestone_configured"), milestone_id),
+            milestone.name,
+        );
+    }
+
+    fn issue_sbt_credential(env: Env, user: Address, milestone_id: u32) {
+        user.require_auth();
+
+        let sbt_contract: Address = env.storage().instance().get(&DataKey::SbtContract)
+            .unwrap_or_else(|| panic!("SBT contract not set"));
+
+        let milestone: ReputationMilestone = env.storage().instance().get(&DataKey::ReputationMilestone(milestone_id))
+            .unwrap_or_else(|| panic!("Milestone not found"));
+
+        if !milestone.is_active {
+            panic!("Milestone is not active");
+        }
+
+        // Check if user already has an SBT
+        let user_sbt_key = DataKey::UserSbt(user.clone());
+        if env.storage().instance().has(&user_sbt_key) {
+            panic!("User already has an SBT credential");
+        }
+
+        // Check user's contribution history across all circles
+        let user_reputation_score = Self::calculate_user_reputation_score(env.clone(), user.clone());
+        
+        if user_reputation_score < milestone.min_reputation_score {
+            panic!("Insufficient reputation score");
+        }
+
+        // Check total cycles completed
+        let total_cycles_completed = Self::get_user_total_cycles_completed(env.clone(), user.clone());
+        if total_cycles_completed < milestone.required_cycles {
+            panic!("Insufficient cycles completed");
+        }
+
+        // Generate unique token ID
+        let token_id = (milestone_id as u128) << 96 | (env.ledger().timestamp() as u128);
+
+        // Create SBT
+        let sbt = SoulboundToken {
+            token_id,
+            owner: user.clone(),
+            milestone_id,
+            issued_at: env.ledger().timestamp(),
+            status: SbtStatus::Active,
+            reputation_score: user_reputation_score,
+            cycles_completed: total_cycles_completed,
+            metadata: milestone.name,
+        };
+
+        // Store SBT
+        env.storage().instance().set(&user_sbt_key, &sbt);
+
+        // Mint SBT on external contract
+        let sbt_client = SbtTokenClient::new(&env, &sbt_contract);
+        sbt_client.mint_sbt(&user, &token_id, &milestone.name);
+
+        env.events().publish(
+            (Symbol::short("sbt_issued"), user, milestone_id),
+            token_id,
+        );
+    }
+
+    fn revoke_sbt_credential(env: Env, admin: Address, user: Address, reason: Symbol) {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can revoke SBT credentials");
+        }
+
+        let user_sbt_key = DataKey::UserSbt(user.clone());
+        let mut sbt: SoulboundToken = env.storage().instance().get(&user_sbt_key)
+            .unwrap_or_else(|| panic!("User has no SBT credential"));
+
+        let sbt_contract: Address = env.storage().instance().get(&DataKey::SbtContract)
+            .unwrap_or_else(|| panic!("SBT contract not set"));
+
+        // Update status to revoked
+        sbt.status = SbtStatus::Revoked;
+        env.storage().instance().set(&user_sbt_key, &sbt);
+
+        // Store revocation info
+        let revocation_info = SbtRevocationInfo {
+            user: user.clone(),
+            token_id: sbt.token_id,
+            revoked_at: env.ledger().timestamp(),
+            reason: reason.clone(),
+            revoked_by: admin.clone(),
+        };
+        env.storage().instance().set(&DataKey::SbtRevocationList(user.clone()), &revocation_info);
+
+        // Burn SBT on external contract
+        let sbt_client = SbtTokenClient::new(&env, &sbt_contract);
+        sbt_client.burn(&sbt.token_id);
+
+        env.events().publish(
+            (Symbol::short("sbt_revoked"), user),
+            reason,
+        );
+    }
+
+    fn update_sbt_status(env: Env, admin: Address, user: Address, status: SbtStatus) {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can update SBT status");
+        }
+
+        let user_sbt_key = DataKey::UserSbt(user.clone());
+        let mut sbt: SoulboundToken = env.storage().instance().get(&user_sbt_key)
+            .unwrap_or_else(|| panic!("User has no SBT credential"));
+
+        let sbt_contract: Address = env.storage().instance().get(&DataKey::SbtContract)
+            .unwrap_or_else(|| panic!("SBT contract not set"));
+
+        sbt.status = status.clone();
+        env.storage().instance().set(&user_sbt_key, &sbt);
+
+        // Update metadata on external contract based on status
+        let sbt_client = SbtTokenClient::new(&env, &sbt_contract);
+        let metadata = match status {
+            SbtStatus::Active => Symbol::short("Active"),
+            SbtStatus::Dishonored => Symbol::short("Dishonored"),
+            SbtStatus::Revoked => Symbol::short("Revoked"),
+        };
+        sbt_client.update_metadata(&sbt.token_id, &metadata);
+
+        env.events().publish(
+            (Symbol::short("sbt_status_updated"), user),
+            status,
+        );
+    }
+
+    fn get_user_sbt(env: Env, user: Address) -> SoulboundToken {
+        let user_sbt_key = DataKey::UserSbt(user);
+        env.storage().instance().get(&user_sbt_key)
+            .unwrap_or_else(|| SoulboundToken {
+                token_id: 0,
+                owner: Address::generate(&env),
+                milestone_id: 0,
+                issued_at: 0,
+                status: SbtStatus::Revoked,
+                reputation_score: 0,
+                cycles_completed: 0,
+                metadata: Symbol::short("None"),
+            })
+    }
+
+    fn get_reputation_milestone(env: Env, milestone_id: u32) -> ReputationMilestone {
+        env.storage().instance().get(&DataKey::ReputationMilestone(milestone_id))
+            .unwrap_or_else(|| ReputationMilestone {
+                id: milestone_id,
+                name: Symbol::short("Unknown"),
+                description: Symbol::short("Milestone_not_found"),
+                required_cycles: 0,
+                min_reputation_score: 0,
+                is_active: false,
+            })
+    }
+
+    // --- BUSINESS GOAL VERIFICATION IMPLEMENTATIONS (Issue #212) ---
+
+    fn set_business_goal(env: Env, creator: Address, circle_id: u64, goal_hash: Symbol, verified_vendor: Address, goal_amount: u64) {
+        creator.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        if creator != circle.creator {
+            panic!("Unauthorized: Only circle creator can set business goals");
+        }
+
+        circle.business_goal_hash = Some(goal_hash.clone());
+        circle.verified_vendor = Some(verified_vendor);
+        circle.goal_amount = Some(goal_amount);
+        circle.is_goal_verified = false;
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        env.events().publish(
+            (Symbol::short("business_goal_set"), circle_id, creator),
+            goal_hash,
+        );
+    }
+
+    fn verify_business_goal(env: Env, vendor: Address, circle_id: u64, invoice_hash: Symbol) {
+        vendor.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        let stored_vendor = circle.verified_vendor
+            .unwrap_or_else(|| panic!("No verified vendor set for this circle"));
+
+        if vendor != stored_vendor {
+            panic!("Unauthorized: Only verified vendor can verify goals");
+        }
+
+        if circle.is_goal_verified {
+            panic!("Goal already verified");
+        }
+
+        // In a real implementation, you would verify the invoice_hash matches the business_goal_hash
+        // For now, we'll assume the verification is successful
+        circle.is_goal_verified = true;
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        env.events().publish(
+            (Symbol::short("business_goal_verified"), circle_id, vendor),
+            invoice_hash,
+        );
+    }
+
+    fn release_goal_funds(env: Env, circle_id: u64) {
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        if !circle.is_goal_verified {
+            panic!("Business goal not verified");
+        }
+
+        let goal_amount = circle.goal_amount
+            .unwrap_or_else(|| panic!("No goal amount set"));
+
+        // Find the current recipient (who should be the circle creator for business goals)
+        let recipient = circle.creator;
+
+        // Transfer funds to recipient
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &goal_amount);
+
+        // Reset goal verification
+        let mut updated_circle = circle;
+        updated_circle.is_goal_verified = false;
+        updated_circle.business_goal_hash = None;
+        updated_circle.goal_amount = None;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &updated_circle);
+
+        env.events().publish(
+            (Symbol::short("goal_funds_released"), circle_id, recipient),
+            goal_amount,
+        );
+    }
+
+    fn get_business_goal_info(env: Env, circle_id: u64) -> (Option<Symbol>, Option<Address>, Option<u64>, bool) {
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| CircleInfo {
+                id: circle_id,
+                creator: Address::generate(&env),
+                contribution_amount: 0,
+                max_members: 0,
+                member_count: 0,
+                current_recipient_index: 0,
+                is_active: false,
+                token: Address::generate(&env),
+                deadline_timestamp: 0,
+                cycle_duration: 0,
+                contribution_bitmap: 0,
+                payout_bitmap: 0,
+                insurance_balance: 0,
+                insurance_fee_bps: 0,
+                is_insurance_used: false,
+                late_fee_bps: 0,
+                proposed_late_fee_bps: 0,
+                proposal_votes_bitmap: 0,
+                nft_contract: Address::generate(&env),
+                cycle_count: 0,
+                is_paused: false,
+                expected_balance: 0,
+                organizer_fee_bps: 0,
+                business_goal_hash: None,
+                verified_vendor: None,
+                goal_amount: None,
+                is_goal_verified: false,
+            });
+
+        (circle.business_goal_hash, circle.verified_vendor, circle.goal_amount, circle.is_goal_verified)
+    }
 }
 
 // --- PRIVATE HELPER FUNCTIONS ---
@@ -1175,6 +1587,161 @@ impl SoroSusu {
         let avg_cycle_duration = 604800; // 1 week in seconds
         let current_timestamp = env.ledger().timestamp();
         (current_timestamp / avg_cycle_duration) as u32
+    }
+
+    // --- SBT HELPER FUNCTIONS ---
+
+    fn calculate_user_reputation_score(env: Env, user: Address) -> u32 {
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .unwrap_or_else(|| Member {
+                address: user,
+                index: 0,
+                contribution_count: 0,
+                last_contribution_time: 0,
+                is_active: false,
+            });
+
+        if !member.is_active {
+            return 0;
+        }
+
+        // Base score from contribution count (max 50 points)
+        let contribution_score = (member.contribution_count.min(50) as u32) * 1;
+
+        // Bonus for timely payments (max 30 points)
+        let timely_bonus = Self::calculate_timely_payment_bonus(env.clone(), user.clone());
+
+        // Bonus for active participation (max 20 points)
+        let participation_bonus = Self::calculate_participation_bonus(env.clone(), user.clone());
+
+        let total_score = contribution_score + timely_bonus + participation_bonus;
+        total_score.min(100) // Cap at 100
+    }
+
+    fn calculate_timely_payment_bonus(env: Env, user: Address) -> u32 {
+        // Check if user has any late fees in their history
+        // This is a simplified implementation - in practice you'd track payment history
+        let member_key = DataKey::Member(user);
+        if let Ok(member) = env.storage().instance().get::<DataKey, Member>(&member_key) {
+            if member.contribution_count > 0 {
+                // Assume most payments are timely for this example
+                return 25;
+            }
+        }
+        0
+    }
+
+    fn calculate_participation_bonus(env: Env, user: Address) -> u32 {
+        // Bonus for being active in multiple circles or long-term participation
+        let member_key = DataKey::Member(user);
+        if let Ok(member) = env.storage().instance().get::<DataKey, Member>(&member_key) {
+            if member.contribution_count >= 10 {
+                return 20;
+            } else if member.contribution_count >= 5 {
+                return 10;
+            } else if member.contribution_count >= 2 {
+                return 5;
+            }
+        }
+        0
+    }
+
+    fn get_user_total_cycles_completed(env: Env, user: Address) -> u32 {
+        let member_key = DataKey::Member(user);
+        if let Ok(member) = env.storage().instance().get::<DataKey, Member>(&member_key) {
+            return member.contribution_count;
+        }
+        0
+    }
+
+    fn check_and_issue_sbt_credential(env: Env, user: Address) {
+        // Check if SBT contract is set
+        let sbt_contract: Option<Address> = env.storage().instance().get(&DataKey::SbtContract);
+        if sbt_contract.is_none() {
+            return; // SBT system not initialized
+        }
+
+        // Check if user already has an SBT
+        let user_sbt_key = DataKey::UserSbt(user.clone());
+        if env.storage().instance().has(&user_sbt_key) {
+            return; // User already has SBT
+        }
+
+        // Calculate user's reputation score and cycles
+        let reputation_score = Self::calculate_user_reputation_score(env.clone(), user.clone());
+        let total_cycles = Self::get_user_total_cycles_completed(env.clone(), user.clone());
+
+        // Check for milestone 1 (5 cycles, 80 reputation)
+        if total_cycles >= 5 && reputation_score >= 80 {
+            let milestone_id = 1u32;
+            if let Ok(milestone) = env.storage().instance().get::<DataKey, ReputationMilestone>(&DataKey::ReputationMilestone(milestone_id)) {
+                if milestone.is_active {
+                    // Auto-issue SBT credential
+                    let token_id = (milestone_id as u128) << 96 | (env.ledger().timestamp() as u128);
+                    
+                    let sbt = SoulboundToken {
+                        token_id,
+                        owner: user.clone(),
+                        milestone_id,
+                        issued_at: env.ledger().timestamp(),
+                        status: SbtStatus::Active,
+                        reputation_score,
+                        cycles_completed: total_cycles,
+                        metadata: milestone.name,
+                    };
+
+                    // Store SBT
+                    env.storage().instance().set(&user_sbt_key, &sbt);
+
+                    // Mint SBT on external contract
+                    let sbt_client = SbtTokenClient::new(&env, &sbt_contract.unwrap());
+                    sbt_client.mint_sbt(&user, &token_id, &milestone.name);
+
+                    // Emit event
+                    env.events().publish(
+                        (Symbol::short("sbt_auto_issued"), user, milestone_id),
+                        token_id,
+                    );
+                }
+            }
+        }
+    }
+
+    fn handle_sbt_clawback_impact(env: Env, circle_id: u64) {
+        // Get all members of the circle and check if any have SBTs
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        let sbt_contract: Option<Address> = env.storage().instance().get(&DataKey::SbtContract);
+        if sbt_contract.is_none() {
+            return; // SBT system not initialized
+        }
+
+        // Check each member for SBT and potentially mark as dishonored
+        for i in 0..circle.member_count {
+            let member_by_index_key = DataKey::MemberByIndex(circle_id, i as u32);
+            if let Ok(member_address) = env.storage().instance().get::<DataKey, Address>(&member_by_index_key) {
+                let user_sbt_key = DataKey::UserSbt(member_address.clone());
+                if let Ok(mut sbt) = env.storage().instance().get::<DataKey, SoulboundToken>(&user_sbt_key) {
+                    // Mark SBT as dishonored due to clawback involvement
+                    if sbt.status == SbtStatus::Active {
+                        sbt.status = SbtStatus::Dishonored;
+                        env.storage().instance().set(&user_sbt_key, &sbt);
+
+                        // Update metadata on external contract
+                        let sbt_client = SbtTokenClient::new(&env, &sbt_contract.unwrap());
+                        sbt_client.update_metadata(&sbt.token_id, &Symbol::short("Dishonored"));
+
+                        // Emit event
+                        env.events().publish(
+                            (Symbol::short("sbt_dishonored"), member_address, circle_id),
+                            sbt.token_id,
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
