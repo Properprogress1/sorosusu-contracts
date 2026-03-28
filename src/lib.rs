@@ -4338,6 +4338,325 @@ impl SoroSusuTrait for SoroSusu {
             None => panic!("Circle does not have a basket configuration"),
         }
     }
+
+    // Emergency Manual Revert for Oracle Failure (#205)
+    fn update_oracle_heartbeat(env: Env, oracle: Address) {
+        oracle.require_auth();
+        let current_time = env.ledger().timestamp();
+        let heartbeat = OracleHeartbeat {
+            last_heartbeat: current_time,
+            oracle_address: oracle,
+        };
+        env.storage().instance().set(&DataKey::OracleHeartbeat, &heartbeat);
+    }
+
+    fn activate_trust_mode(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("No admin set"));
+        
+        if stored_admin != admin {
+            panic!("Caller is not the admin");
+        }
+
+        let heartbeat: OracleHeartbeat = env.storage().instance().get(&DataKey::OracleHeartbeat)
+            .unwrap_or_else(|| panic!("No oracle heartbeat found"));
+        
+        let current_time = env.ledger().timestamp();
+        let hours_since_heartbeat = (current_time - heartbeat.last_heartbeat) / 3600;
+        
+        if hours_since_heartbeat < 72 {
+            panic!("Trust mode can only be activated after 72 hours of oracle silence");
+        }
+
+        env.storage().instance().set(&DataKey::TrustMode, &true);
+    }
+
+    fn set_emergency_price(env: Env, circle_id: u64, price: i128, setter: Address) {
+        setter.require_auth();
+        
+        let trust_mode: bool = env.storage().instance().get(&DataKey::TrustMode).unwrap_or(false);
+        if !trust_mode {
+            panic!("Emergency pricing only available in trust mode");
+        }
+
+        let _circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle does not exist"));
+
+        let current_time = env.ledger().timestamp();
+        let emergency_price = EmergencyPrice {
+            circle_id,
+            price,
+            set_by: setter,
+            timestamp: current_time,
+        };
+        env.storage().instance().set(&DataKey::ManualPrice(circle_id), &emergency_price);
+    }
+
+    // Cross-Group Liquidity Sharing Vault (#204)
+    fn create_liquidity_vault(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("No admin set"));
+        
+        if stored_admin != admin {
+            panic!("Caller is not the admin");
+        }
+
+        if !env.storage().instance().has(&DataKey::LiquidityVault) {
+            env.storage().instance().set(&DataKey::LiquidityVault, &0i128);
+        }
+    }
+
+    fn lend_to_circle(env: Env, from_circle_id: u64, to_circle_id: u64, amount: i128, interest_rate: u32, lead: Address) -> u64 {
+        lead.require_auth();
+        
+        let from_circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(from_circle_id))
+            .unwrap_or_else(|| panic!("Source circle does not exist"));
+        let _to_circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(to_circle_id))
+            .unwrap_or_else(|| panic!("Target circle does not exist"));
+
+        let current_time = env.ledger().timestamp();
+        let loan_duration = 30 * 24 * 3600; // 30 days
+        let due_at = current_time + loan_duration;
+
+        let mut loan_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
+        loan_count += 1;
+
+        let loan = CircleLoan {
+            loan_id: loan_count,
+            from_circle_id,
+            to_circle_id,
+            amount,
+            interest_rate,
+            created_at: current_time,
+            due_at,
+            is_repaid: false,
+        };
+
+        env.storage().instance().set(&DataKey::CircleLoan(loan_count), &loan);
+
+        let client = token::Client::new(&env, &from_circle.token);
+        client.transfer(&env.current_contract_address(), &env.current_contract_address(), &amount);
+
+        loan_count
+    }
+
+    fn repay_circle_loan(env: Env, circle_id: u64, loan_id: u64, lead: Address) {
+        lead.require_auth();
+        
+        let mut loan: CircleLoan = env.storage().instance().get(&DataKey::CircleLoan(loan_id))
+            .unwrap_or_else(|| panic!("Loan does not exist"));
+
+        if loan.is_repaid {
+            panic!("Loan already repaid");
+        }
+
+        if loan.to_circle_id != circle_id {
+            panic!("This loan does not belong to your circle");
+        }
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle does not exist"));
+
+        let interest = (loan.amount * loan.interest_rate as i128) / 10000;
+        let total_repayment = loan.amount + interest;
+
+        let client = token::Client::new(&env, &circle.token);
+        client.transfer(&env.current_contract_address(), &env.current_contract_address(), &total_repayment);
+
+        loan.is_repaid = true;
+        env.storage().instance().set(&DataKey::CircleLoan(loan_id), &loan);
+    }
+
+    // Variable Interest Rate for Internal Susu Lending (#203)
+    fn update_circle_risk_level(env: Env, admin: Address, circle_id: u64, late_payments: u32) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("No admin set"));
+        
+        if stored_admin != admin {
+            panic!("Caller is not the admin");
+        }
+
+        let _circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle does not exist"));
+
+        let current_time = env.ledger().timestamp();
+        let risk_score = if late_payments == 0 { 0 } else if late_payments <= 2 { 25 } else if late_payments <= 5 { 50 } else if late_payments <= 10 { 75 } else { 100 };
+
+        let risk_level = CircleRiskLevel {
+            circle_id,
+            risk_score,
+            late_payments,
+            last_updated: current_time,
+        };
+
+        env.storage().instance().set(&DataKey::CircleRiskLevel(circle_id), &risk_level);
+    }
+
+    fn get_dynamic_interest_rate(env: Env, circle_id: u64) -> u32 {
+        let risk_level: CircleRiskLevel = env.storage().instance().get(&DataKey::CircleRiskLevel(circle_id))
+            .unwrap_or_else(|| CircleRiskLevel {
+                circle_id,
+                risk_score: 0,
+                late_payments: 0,
+                last_updated: 0,
+            });
+
+        let base_rate = 200u32; // 2% base rate
+        let max_rate = 1000u32; // 10% max rate
+        
+        let additional_rate = (risk_level.risk_score * (max_rate - base_rate)) / 100;
+        base_rate + additional_rate
+    }
+
+    // Group Lead Performance Bond Slashing (#202)
+    fn post_lead_bond(env: Env, circle_id: u64, lead: Address, bond_amount: i128) {
+        lead.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle does not exist"));
+
+        if circle.creator != lead {
+            panic!("Only circle creator can post bond");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let bond = GroupLeadBond {
+            circle_id,
+            lead_address: lead.clone(),
+            bond_amount,
+            posted_at: current_time,
+            is_slashed: false,
+        };
+
+        env.storage().instance().set(&DataKey::GroupLeadBond(circle_id), &bond);
+
+        let client = token::Client::new(&env, &circle.token);
+        client.transfer(&lead, &env.current_contract_address(), &bond_amount);
+    }
+
+    fn create_slashing_proposal(env: Env, circle_id: u64, target_lead: Address, reason: String, proposer: Address) -> u64 {
+        proposer.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle does not exist"));
+
+        let member_key = DataKey::Member(proposer.clone());
+        let _member: Member = env.storage().instance().get(&member_key)
+            .unwrap_or_else(|| panic!("User is not a member of this circle"));
+
+        let bond: GroupLeadBond = env.storage().instance().get(&DataKey::GroupLeadBond(circle_id))
+            .unwrap_or_else(|| panic!("No bond found for this circle"));
+
+        if bond.lead_address != target_lead {
+            panic!("Target is not the lead of this circle");
+        }
+
+        let mut proposal_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
+        proposal_count += 1;
+
+        let current_time = env.ledger().timestamp();
+        let voting_deadline = current_time + (7 * 24 * 3600); // 7 days
+
+        let proposal = SlashingProposal {
+            proposal_id: proposal_count,
+            circle_id,
+            target_lead,
+            reason,
+            proposed_by: proposer,
+            created_at: current_time,
+            voting_deadline,
+            yes_votes: 0,
+            no_votes: 0,
+            total_members: circle.member_count,
+            is_executed: false,
+        };
+
+        env.storage().instance().set(&DataKey::SlashingProposal(proposal_count), &proposal);
+        proposal_count
+    }
+
+    fn vote_on_slashing(env: Env, voter: Address, proposal_id: u64, vote: bool) {
+        voter.require_auth();
+        
+        let mut proposal: SlashingProposal = env.storage().instance().get(&DataKey::SlashingProposal(proposal_id))
+            .unwrap_or_else(|| panic!("Slashing proposal does not exist"));
+
+        let current_time = env.ledger().timestamp();
+        if current_time > proposal.voting_deadline {
+            panic!("Voting period has ended");
+        }
+
+        let member_key = DataKey::Member(voter.clone());
+        let _member: Member = env.storage().instance().get(&member_key)
+            .unwrap_or_else(|| panic!("User is not a member of this circle"));
+
+        let vote_key = DataKey::Vote(proposal_id, voter.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("User has already voted on this proposal");
+        }
+
+        let vote_record = VoteCast {
+            proposal_id,
+            voter: voter.clone(),
+            vote,
+            voting_power: 1,
+        };
+        env.storage().instance().set(&vote_key, &vote_record);
+
+        if vote {
+            proposal.yes_votes += 1;
+        } else {
+            proposal.no_votes += 1;
+        }
+
+        env.storage().instance().set(&DataKey::SlashingProposal(proposal_id), &proposal);
+    }
+
+    fn execute_slashing(env: Env, executor: Address, proposal_id: u64) {
+        executor.require_auth();
+        
+        let mut proposal: SlashingProposal = env.storage().instance().get(&DataKey::SlashingProposal(proposal_id))
+            .unwrap_or_else(|| panic!("Slashing proposal does not exist"));
+
+        if proposal.is_executed {
+            panic!("Proposal has already been executed");
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time <= proposal.voting_deadline {
+            panic!("Voting period has not ended yet");
+        }
+
+        let required_votes = (proposal.total_members * 90) / 100; // 90% threshold
+        if proposal.yes_votes < required_votes {
+            panic!("Insufficient votes for slashing (90% required)");
+        }
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(proposal.circle_id))
+            .unwrap_or_else(|| panic!("Circle does not exist"));
+
+        let mut bond: GroupLeadBond = env.storage().instance().get(&DataKey::GroupLeadBond(proposal.circle_id))
+            .unwrap_or_else(|| panic!("No bond found for this circle"));
+
+        if bond.is_slashed {
+            panic!("Bond already slashed");
+        }
+
+        let _client = token::Client::new(&env, &circle.token);
+        
+        let _slash_per_member = bond.bond_amount / proposal.total_members as i128;
+        
+        env.events().publish((Symbol::new(&env, "bond_slashed"),), (proposal.circle_id, bond.bond_amount, proposal.total_members));
+        
+        bond.is_slashed = true;
+        env.storage().instance().set(&DataKey::GroupLeadBond(proposal.circle_id), &bond);
+
+        proposal.is_executed = true;
+        env.storage().instance().set(&DataKey::SlashingProposal(proposal_id), &proposal);
+    }
 }
 
 fn execute_yield_delegation_internal(env: &Env, circle_id: u64, delegation: &mut YieldDelegation) {
