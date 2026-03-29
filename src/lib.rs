@@ -1,8 +1,10 @@
 #![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, Vec, Symbol, token, testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
+use soroban_sdk::{contract, contracttype, contractimpl, Address, BytesN, Env, Vec, Symbol, token, testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
 
 // --- DATA STRUCTURES ---
-const TAX_WITHHOLDING_BPS: u64 = 1000; // 10%
+const TAX_WITHHOLDING_MIN_BPS: u32 = 1000; // 10%
+const TAX_WITHHOLDING_MAX_BPS: u32 = 2000; // 20%
+const DEFAULT_TAX_WITHHOLDING_BPS: u32 = TAX_WITHHOLDING_MIN_BPS;
 
 #[contracttype]
 #[derive(Clone)]
@@ -30,6 +32,11 @@ pub enum DataKey {
     TaxClaimedByUser(u64, Address),  // circle_id, user
     GrossInterestTotal(u64),         // circle_id
     GrossInterestByUser(u64, Address), // circle_id, user
+    TaxWithholdingBps(u64),          // circle_id
+    TaxReleasedTotal(u64),           // circle_id
+    TaxReleasedByUser(u64, Address), // circle_id, user
+    TaxFilingProof(u64, Address),    // circle_id, user => proof hash
+    TaxProofTimestamp(u64, Address), // circle_id, user
 }
 
 #[contracttype]
@@ -78,7 +85,12 @@ pub struct TaxReport {
     pub total_tax_withheld_for_user: u64,
     pub total_tax_claimed_for_circle: u64,
     pub total_tax_claimed_for_user: u64,
+    pub total_tax_released_for_circle: u64,
+    pub total_tax_released_for_user: u64,
     pub current_tax_vault_balance: u64,
+    pub withholding_bps: u32,
+    pub has_tax_filing_proof: bool,
+    pub last_tax_proof_timestamp: u64,
 }
 
 // --- CONTRACT TRAIT ---
@@ -110,11 +122,16 @@ pub trait SoroSusuTrait {
     fn update_global_fee(env: Env, admin: Address, new_fee: u32);
 
     // Tax Withholding Escrow for Interest Earnings
+    fn set_tax_withholding_rate(env: Env, admin: Address, circle_id: u64, withholding_bps: u32);
+    fn get_tax_withholding_rate(env: Env, circle_id: u64) -> u32;
     fn process_interest_earning(env: Env, operator: Address, circle_id: u64, beneficiary: Address, gross_interest: u64) -> (u64, u64);
-    fn claim_tax_vault(env: Env, user: Address, circle_id: u64) -> u64;
+    fn claim_tax_vault(env: Env, user: Address, circle_id: u64, tax_recipient: Address) -> u64;
+    fn provide_tax_filing_proof(env: Env, user: Address, circle_id: u64, proof_hash: BytesN<32>);
+    fn release_tax_vault(env: Env, user: Address, circle_id: u64) -> u64;
     fn get_tax_vault_balance(env: Env, user: Address, circle_id: u64) -> u64;
     fn get_total_tax_withheld(env: Env, circle_id: u64) -> u64;
     fn get_total_tax_claimed(env: Env, circle_id: u64) -> u64;
+    fn get_total_tax_released(env: Env, circle_id: u64) -> u64;
     fn get_tax_report(env: Env, user: Address, circle_id: u64) -> TaxReport;
 }
 
@@ -122,12 +139,19 @@ fn checked_add_u64(a: u64, b: u64, context: &str) -> u64 {
     a.checked_add(b).unwrap_or_else(|| panic!("{}", context))
 }
 
-fn calculate_interest_tax_split(gross_interest: u64) -> (u64, u64) {
+fn validate_tax_withholding_bps(withholding_bps: u32) {
+    if !(TAX_WITHHOLDING_MIN_BPS..=TAX_WITHHOLDING_MAX_BPS).contains(&withholding_bps) {
+        panic!("Tax withholding must be between 10% and 20%");
+    }
+}
+
+fn calculate_interest_tax_split(gross_interest: u64, withholding_bps: u32) -> (u64, u64) {
     if gross_interest == 0 {
         return (0, 0);
     }
 
-    let tax_withheld = (gross_interest * TAX_WITHHOLDING_BPS) / 10_000;
+    validate_tax_withholding_bps(withholding_bps);
+    let tax_withheld = (gross_interest * withholding_bps as u64) / 10_000;
     let net_interest = gross_interest - tax_withheld;
     (tax_withheld, net_interest)
 }
@@ -180,6 +204,9 @@ impl SoroSusuTrait for SoroSusu {
         // 4. Save the Circle, Bond, and Count
         env.storage().instance().set(&DataKey::Circle(circle_count), &new_circle);
         env.storage().instance().set(&DataKey::Bond(circle_count), &bond_amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::TaxWithholdingBps(circle_count), &DEFAULT_TAX_WITHHOLDING_BPS);
         env.storage().instance().set(&DataKey::CircleCount, &circle_count);
 
         // 5. Initialize Group Reserve if not exists
@@ -443,6 +470,29 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::GlobalFeeBP, &new_fee);
     }
 
+    fn set_tax_withholding_rate(env: Env, admin: Address, circle_id: u64, withholding_bps: u32) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("Only admin can set tax withholding rate");
+        }
+
+        if !env.storage().instance().has(&DataKey::Circle(circle_id)) {
+            panic!("Circle not found");
+        }
+        validate_tax_withholding_bps(withholding_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::TaxWithholdingBps(circle_id), &withholding_bps);
+    }
+
+    fn get_tax_withholding_rate(env: Env, circle_id: u64) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TaxWithholdingBps(circle_id))
+            .unwrap_or(DEFAULT_TAX_WITHHOLDING_BPS)
+    }
+
     fn process_interest_earning(env: Env, operator: Address, circle_id: u64, beneficiary: Address, gross_interest: u64) -> (u64, u64) {
         operator.require_auth();
         if gross_interest == 0 {
@@ -458,7 +508,12 @@ impl SoroSusuTrait for SoroSusu {
         let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
 
-        let (tax_withheld, net_interest) = calculate_interest_tax_split(gross_interest);
+        let withholding_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TaxWithholdingBps(circle_id))
+            .unwrap_or(DEFAULT_TAX_WITHHOLDING_BPS);
+        let (tax_withheld, net_interest) = calculate_interest_tax_split(gross_interest, withholding_bps);
         let token_client = token::Client::new(&env, &circle.token);
 
         // Interest inflow is deposited to contract first, then net is paid to beneficiary.
@@ -491,13 +546,13 @@ impl SoroSusuTrait for SoroSusu {
 
         env.events().publish(
             (Symbol::new(&env, "tax_withheld"), circle_id, beneficiary.clone()),
-            (gross_interest, tax_withheld, net_interest, updated_vault),
+            (gross_interest, tax_withheld, net_interest, updated_vault, withholding_bps),
         );
 
         (tax_withheld, net_interest)
     }
 
-    fn claim_tax_vault(env: Env, user: Address, circle_id: u64) -> u64 {
+    fn claim_tax_vault(env: Env, user: Address, circle_id: u64, tax_recipient: Address) -> u64 {
         user.require_auth();
 
         let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
@@ -509,7 +564,7 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         let token_client = token::Client::new(&env, &circle.token);
-        token_client.transfer(&env.current_contract_address(), &user, &claim_amount);
+        token_client.transfer(&env.current_contract_address(), &tax_recipient, &claim_amount);
         env.storage().instance().set(&vault_key, &0u64);
 
         let total_claimed_key = DataKey::TaxClaimedTotal(circle_id);
@@ -521,11 +576,71 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&user_claimed_key, &checked_add_u64(user_claimed, claim_amount, "User tax claimed overflow"));
 
         env.events().publish(
-            (Symbol::new(&env, "tax_claimed"), circle_id, user.clone()),
-            claim_amount,
+            (Symbol::new(&env, "tax_claimed"), circle_id, user.clone(), tax_recipient),
+            (claim_amount,),
         );
 
         claim_amount
+    }
+
+    fn provide_tax_filing_proof(env: Env, user: Address, circle_id: u64, proof_hash: BytesN<32>) {
+        user.require_auth();
+        if !env.storage().instance().has(&DataKey::Circle(circle_id)) {
+            panic!("Circle not found");
+        }
+        let proof_key = DataKey::TaxFilingProof(circle_id, user.clone());
+        let proof_time_key = DataKey::TaxProofTimestamp(circle_id, user.clone());
+        env.storage().instance().set(&proof_key, &proof_hash.clone());
+        env.storage()
+            .instance()
+            .set(&proof_time_key, &env.ledger().timestamp());
+
+        env.events().publish(
+            (Symbol::new(&env, "tax_proof"), circle_id, user),
+            proof_hash,
+        );
+    }
+
+    fn release_tax_vault(env: Env, user: Address, circle_id: u64) -> u64 {
+        user.require_auth();
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        let proof_key = DataKey::TaxFilingProof(circle_id, user.clone());
+        if !env.storage().instance().has(&proof_key) {
+            panic!("Tax filing proof required before release");
+        }
+
+        let vault_key = DataKey::TaxVault(circle_id, user.clone());
+        let release_amount: u64 = env.storage().instance().get(&vault_key).unwrap_or(0);
+        if release_amount == 0 {
+            panic!("Nothing to release");
+        }
+
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&env.current_contract_address(), &user, &release_amount);
+        env.storage().instance().set(&vault_key, &0u64);
+
+        let total_released_key = DataKey::TaxReleasedTotal(circle_id);
+        let total_released: u64 = env.storage().instance().get(&total_released_key).unwrap_or(0);
+        env.storage().instance().set(
+            &total_released_key,
+            &checked_add_u64(total_released, release_amount, "Total tax released overflow"),
+        );
+
+        let user_released_key = DataKey::TaxReleasedByUser(circle_id, user.clone());
+        let user_released: u64 = env.storage().instance().get(&user_released_key).unwrap_or(0);
+        env.storage().instance().set(
+            &user_released_key,
+            &checked_add_u64(user_released, release_amount, "User tax released overflow"),
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "tax_released"), circle_id, user.clone()),
+            release_amount,
+        );
+
+        release_amount
     }
 
     fn get_tax_vault_balance(env: Env, user: Address, circle_id: u64) -> u64 {
@@ -540,7 +655,13 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().get(&DataKey::TaxClaimedTotal(circle_id)).unwrap_or(0)
     }
 
+    fn get_total_tax_released(env: Env, circle_id: u64) -> u64 {
+        env.storage().instance().get(&DataKey::TaxReleasedTotal(circle_id)).unwrap_or(0)
+    }
+
     fn get_tax_report(env: Env, user: Address, circle_id: u64) -> TaxReport {
+        let proof_key = DataKey::TaxFilingProof(circle_id, user.clone());
+        let proof_time_key = DataKey::TaxProofTimestamp(circle_id, user.clone());
         TaxReport {
             circle_id,
             user: user.clone(),
@@ -550,7 +671,12 @@ impl SoroSusuTrait for SoroSusu {
             total_tax_withheld_for_user: env.storage().instance().get(&DataKey::TaxWithheldByUser(circle_id, user.clone())).unwrap_or(0),
             total_tax_claimed_for_circle: env.storage().instance().get(&DataKey::TaxClaimedTotal(circle_id)).unwrap_or(0),
             total_tax_claimed_for_user: env.storage().instance().get(&DataKey::TaxClaimedByUser(circle_id, user.clone())).unwrap_or(0),
+            total_tax_released_for_circle: env.storage().instance().get(&DataKey::TaxReleasedTotal(circle_id)).unwrap_or(0),
+            total_tax_released_for_user: env.storage().instance().get(&DataKey::TaxReleasedByUser(circle_id, user.clone())).unwrap_or(0),
             current_tax_vault_balance: env.storage().instance().get(&DataKey::TaxVault(circle_id, user)).unwrap_or(0),
+            withholding_bps: env.storage().instance().get(&DataKey::TaxWithholdingBps(circle_id)).unwrap_or(DEFAULT_TAX_WITHHOLDING_BPS),
+            has_tax_filing_proof: env.storage().instance().has(&proof_key),
+            last_tax_proof_timestamp: env.storage().instance().get(&proof_time_key).unwrap_or(0),
         }
     }
 }

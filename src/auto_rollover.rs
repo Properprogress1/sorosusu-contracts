@@ -12,7 +12,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 
 // --- CONSTANTS ---
 
@@ -21,8 +21,10 @@ const ROLLOVER_APPROVAL_THRESHOLD_BPS: u32 = 5100;
 
 /// Number of rounds before end to trigger continuity vote
 const ROLLOVER_TRIGGER_ROUNDS_BEFORE_END: u32 = 2;
-/// 10% tax withholding from earned interest
-const TAX_WITHHOLDING_BPS: u32 = 1000;
+/// Tax withholding range from earned interest
+const TAX_WITHHOLDING_MIN_BPS: u32 = 1000; // 10%
+const TAX_WITHHOLDING_MAX_BPS: u32 = 2000; // 20%
+const DEFAULT_TAX_WITHHOLDING_BPS: u32 = TAX_WITHHOLDING_MIN_BPS;
 
 /// Data key for rollover state per circle
 #[contracttype]
@@ -34,6 +36,9 @@ pub enum RolloverDataKey {
     RolloverVotesCount(u64),    // Count of yes/no votes
     TaxVault(u64, Address),     // Tax vault by (circle_id, user)
     TaxVaultTotalWithheld(u64), // Aggregate withheld tax for circle
+    TaxVaultTotalReleased(u64), // Aggregate released tax for circle
+    TaxVaultProof(u64, Address), // Tax filing proof hash by (circle_id, user)
+    TaxVaultProofTimestamp(u64, Address), // Tax filing proof timestamp by (circle_id, user)
 }
 
 // --- DATA STRUCTURES ---
@@ -97,8 +102,12 @@ pub struct TaxVault {
     pub withheld_balance: i128,
     pub total_withheld: i128,
     pub total_claimed: i128,
+    pub total_released: i128,
     pub last_withheld_timestamp: u64,
     pub last_claim_timestamp: u64,
+    pub last_release_timestamp: u64,
+    pub withholding_bps: u32,
+    pub last_proof_hash: Option<BytesN<32>>,
 }
 
 /// Return value of an interest-tax withholding operation.
@@ -109,6 +118,7 @@ pub struct TaxWithholdingResult {
     pub tax_withheld: i128,
     pub net_interest: i128,
     pub resulting_tax_vault_balance: i128,
+    pub withholding_bps: u32,
 }
 
 /// Default implementation for RolloverVote
@@ -156,8 +166,12 @@ impl TaxVault {
             withheld_balance: 0,
             total_withheld: 0,
             total_claimed: 0,
+            total_released: 0,
             last_withheld_timestamp: 0,
             last_claim_timestamp: 0,
+            last_release_timestamp: 0,
+            withholding_bps: DEFAULT_TAX_WITHHOLDING_BPS,
+            last_proof_hash: None,
         }
     }
 }
@@ -348,15 +362,26 @@ pub fn get_rollover_preparation(env: &Env, circle_id: u64) -> RolloverPreparatio
 
 // --- TAX WITHHOLDING ESCROW FUNCTIONS ---
 
-/// Calculates 10% withholding from earned interest and net distributable interest.
-pub fn calculate_interest_tax_withholding(interest_earned: i128) -> (i128, i128) {
+fn validate_withholding_bps(withholding_bps: u32) -> Result<(), TaxEscrowError> {
+    if !(TAX_WITHHOLDING_MIN_BPS..=TAX_WITHHOLDING_MAX_BPS).contains(&withholding_bps) {
+        return Err(TaxEscrowError::InvalidWithholdingRate);
+    }
+    Ok(())
+}
+
+/// Calculates 10%-20% withholding from earned interest and net distributable interest.
+pub fn calculate_interest_tax_withholding(
+    interest_earned: i128,
+    withholding_bps: u32,
+) -> Result<(i128, i128), TaxEscrowError> {
+    validate_withholding_bps(withholding_bps)?;
     if interest_earned <= 0 {
-        return (0, interest_earned);
+        return Ok((0, interest_earned));
     }
 
-    let tax_withheld = (interest_earned * TAX_WITHHOLDING_BPS as i128) / 10000;
+    let tax_withheld = (interest_earned * withholding_bps as i128) / 10000;
     let net_interest = interest_earned - tax_withheld;
-    (tax_withheld, net_interest)
+    Ok((tax_withheld, net_interest))
 }
 
 /// Applies automatic tax withholding to interest earnings and credits the user's tax vault.
@@ -365,8 +390,10 @@ pub fn withhold_tax_from_interest(
     circle_id: u64,
     user: Address,
     interest_earned: i128,
-) -> TaxWithholdingResult {
-    let (tax_withheld, net_interest) = calculate_interest_tax_withholding(interest_earned);
+    withholding_bps: u32,
+) -> Result<TaxWithholdingResult, TaxEscrowError> {
+    let (tax_withheld, net_interest) =
+        calculate_interest_tax_withholding(interest_earned, withholding_bps)?;
     let key = RolloverDataKey::TaxVault(circle_id, user.clone());
     let mut vault: TaxVault = env
         .storage()
@@ -378,6 +405,7 @@ pub fn withhold_tax_from_interest(
         vault.withheld_balance += tax_withheld;
         vault.total_withheld += tax_withheld;
         vault.last_withheld_timestamp = env.ledger().timestamp();
+        vault.withholding_bps = withholding_bps;
         env.storage().instance().set(&key, &vault);
 
         let total_key = RolloverDataKey::TaxVaultTotalWithheld(circle_id);
@@ -387,12 +415,13 @@ pub fn withhold_tax_from_interest(
             .set(&total_key, &(total_withheld + tax_withheld));
     }
 
-    TaxWithholdingResult {
+    Ok(TaxWithholdingResult {
         gross_interest: interest_earned,
         tax_withheld,
         net_interest,
         resulting_tax_vault_balance: vault.withheld_balance,
-    }
+        withholding_bps,
+    })
 }
 
 /// Allows user to claim all withheld tax funds from their tax vault.
@@ -424,6 +453,64 @@ pub fn claim_tax_vault(
     Ok(claim_amount)
 }
 
+/// Allows user to release withheld tax vault back to themselves
+/// after providing a proof hash for tax filing.
+pub fn provide_tax_filing_proof(
+    env: &Env,
+    circle_id: u64,
+    user: Address,
+    proof_hash: BytesN<32>,
+) {
+    user.require_auth();
+
+    let proof_key = RolloverDataKey::TaxVaultProof(circle_id, user.clone());
+    let proof_time_key = RolloverDataKey::TaxVaultProofTimestamp(circle_id, user);
+    env.storage().instance().set(&proof_key, &proof_hash);
+    env.storage()
+        .instance()
+        .set(&proof_time_key, &env.ledger().timestamp());
+}
+
+pub fn release_tax_vault(
+    env: &Env,
+    circle_id: u64,
+    user: Address,
+) -> Result<i128, TaxEscrowError> {
+    user.require_auth();
+
+    let proof_key = RolloverDataKey::TaxVaultProof(circle_id, user.clone());
+    if !env.storage().instance().has(&proof_key) {
+        return Err(TaxEscrowError::ProofRequiredForRelease);
+    }
+
+    let key = RolloverDataKey::TaxVault(circle_id, user.clone());
+    let mut vault: TaxVault = env
+        .storage()
+        .instance()
+        .get(&key)
+        .unwrap_or_else(|| TaxVault::new(circle_id, user.clone()));
+
+    if vault.withheld_balance <= 0 {
+        return Err(TaxEscrowError::NothingToClaim);
+    }
+
+    let release_amount = vault.withheld_balance;
+    vault.withheld_balance = 0;
+    vault.total_released += release_amount;
+    vault.last_release_timestamp = env.ledger().timestamp();
+    let stored_proof: BytesN<32> = env.storage().instance().get(&proof_key).unwrap();
+    vault.last_proof_hash = Some(stored_proof);
+    env.storage().instance().set(&key, &vault);
+
+    let total_key = RolloverDataKey::TaxVaultTotalReleased(circle_id);
+    let total_released: i128 = env.storage().instance().get(&total_key).unwrap_or(0);
+    env.storage()
+        .instance()
+        .set(&total_key, &(total_released + release_amount));
+
+    Ok(release_amount)
+}
+
 /// Reads the user's tax vault state.
 pub fn get_tax_vault(env: &Env, circle_id: u64, user: Address) -> TaxVault {
     let key = RolloverDataKey::TaxVault(circle_id, user.clone());
@@ -436,6 +523,12 @@ pub fn get_tax_vault(env: &Env, circle_id: u64, user: Address) -> TaxVault {
 /// Reads the aggregate tax withheld for a circle.
 pub fn get_total_tax_withheld(env: &Env, circle_id: u64) -> i128 {
     let key = RolloverDataKey::TaxVaultTotalWithheld(circle_id);
+    env.storage().instance().get(&key).unwrap_or(0)
+}
+
+/// Reads the aggregate tax released for a circle.
+pub fn get_total_tax_released(env: &Env, circle_id: u64) -> i128 {
+    let key = RolloverDataKey::TaxVaultTotalReleased(circle_id);
     env.storage().instance().get(&key).unwrap_or(0)
 }
 
@@ -458,6 +551,8 @@ pub enum RolloverError {
 #[repr(u32)]
 pub enum TaxEscrowError {
     NothingToClaim = 1,
+    InvalidWithholdingRate = 2,
+    ProofRequiredForRelease = 3,
 }
 
 #[cfg(test)]
@@ -508,11 +603,11 @@ mod tests {
 
     #[test]
     fn test_calculate_interest_tax_withholding() {
-        let (tax, net) = calculate_interest_tax_withholding(100_000_000);
+        let (tax, net) = calculate_interest_tax_withholding(100_000_000, 1000).unwrap();
         assert_eq!(tax, 10_000_000);
         assert_eq!(net, 90_000_000);
 
-        let (tax_zero, net_zero) = calculate_interest_tax_withholding(0);
+        let (tax_zero, net_zero) = calculate_interest_tax_withholding(0, 1000).unwrap();
         assert_eq!(tax_zero, 0);
         assert_eq!(net_zero, 0);
     }
@@ -523,15 +618,17 @@ mod tests {
         let user = Address::generate(&env);
         let circle_id = 42u64;
 
-        let result = withhold_tax_from_interest(&env, circle_id, user.clone(), 50_000_000);
-        assert_eq!(result.tax_withheld, 5_000_000);
-        assert_eq!(result.net_interest, 45_000_000);
-        assert_eq!(result.resulting_tax_vault_balance, 5_000_000);
+        let result =
+            withhold_tax_from_interest(&env, circle_id, user.clone(), 50_000_000, 1500).unwrap();
+        assert_eq!(result.tax_withheld, 7_500_000);
+        assert_eq!(result.net_interest, 42_500_000);
+        assert_eq!(result.resulting_tax_vault_balance, 7_500_000);
+        assert_eq!(result.withholding_bps, 1500);
 
         let vault = get_tax_vault(&env, circle_id, user);
-        assert_eq!(vault.withheld_balance, 5_000_000);
-        assert_eq!(vault.total_withheld, 5_000_000);
-        assert_eq!(get_total_tax_withheld(&env, circle_id), 5_000_000);
+        assert_eq!(vault.withheld_balance, 7_500_000);
+        assert_eq!(vault.total_withheld, 7_500_000);
+        assert_eq!(get_total_tax_withheld(&env, circle_id), 7_500_000);
     }
 
     #[test]
@@ -541,7 +638,7 @@ mod tests {
         let user = Address::generate(&env);
         let circle_id = 7u64;
 
-        withhold_tax_from_interest(&env, circle_id, user.clone(), 10_000_000);
+        withhold_tax_from_interest(&env, circle_id, user.clone(), 10_000_000, 1000).unwrap();
         let claimed = claim_tax_vault(&env, circle_id, user.clone()).unwrap();
         assert_eq!(claimed, 1_000_000);
 
@@ -551,5 +648,44 @@ mod tests {
 
         let nothing_left = claim_tax_vault(&env, circle_id, user);
         assert_eq!(nothing_left, Err(TaxEscrowError::NothingToClaim));
+    }
+
+    #[test]
+    fn test_release_tax_vault_with_proof() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let user = Address::generate(&env);
+        let circle_id = 9u64;
+        let proof_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+        withhold_tax_from_interest(&env, circle_id, user.clone(), 20_000_000, 2000).unwrap();
+        provide_tax_filing_proof(&env, circle_id, user.clone(), proof_hash);
+        let released = release_tax_vault(&env, circle_id, user.clone()).unwrap();
+        assert_eq!(released, 4_000_000);
+
+        let vault = get_tax_vault(&env, circle_id, user);
+        assert_eq!(vault.withheld_balance, 0);
+        assert_eq!(vault.total_released, 4_000_000);
+        assert_eq!(get_total_tax_released(&env, circle_id), 4_000_000);
+    }
+
+    #[test]
+    fn test_release_requires_proof() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let user = Address::generate(&env);
+        let circle_id = 11u64;
+        withhold_tax_from_interest(&env, circle_id, user.clone(), 20_000_000, 1000).unwrap();
+        let release = release_tax_vault(&env, circle_id, user);
+        assert_eq!(release, Err(TaxEscrowError::ProofRequiredForRelease));
+    }
+
+    #[test]
+    fn test_invalid_withholding_rate_rejected() {
+        let env = Env::default();
+        let user = Address::generate(&env);
+        let circle_id = 10u64;
+        let result = withhold_tax_from_interest(&env, circle_id, user, 10_000_000, 2500);
+        assert!(matches!(result, Err(TaxEscrowError::InvalidWithholdingRate)));
     }
 }
